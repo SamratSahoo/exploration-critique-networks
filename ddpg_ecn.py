@@ -272,7 +272,9 @@ class PositionalEncoding(nn.Module):
     pass
 
 
-ExplorationBufferElement = namedtuple("ExplorationBufferElement", "latent_state action")
+ExplorationBufferElement = namedtuple(
+    "ExplorationBufferElement", "latent_state action latent_next_state"
+)
 
 
 class ExplorationBuffer:
@@ -280,8 +282,10 @@ class ExplorationBuffer:
     def __init__(self, maxlen=5000):
         self.buffer = deque(maxlen=maxlen)
 
-    def add(self, latent_state, action):
-        self.buffer.append(ExplorationBufferElement(latent_state, action))
+    def add(self, latent_state, action, latent_next_state):
+        self.buffer.append(
+            ExplorationBufferElement(latent_state, action, latent_next_state)
+        )
 
 
 class ExplorationCritic(nn.Module):
@@ -325,8 +329,37 @@ class ExplorationCritic(nn.Module):
         )
         self.exploration_transfromer = nn.TransformerEncoder(encode_layer, num_layers=8)
 
-    def forward(self, latent_state, latent_next_state, action):
-        pass
+        # Cross Attention layer between exploration buffer sequence and current state/action/next state sequence
+        # Evaluates novelty of current exploration in reference to previous experience
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=transformer_embedding_size, nhead=heads
+        )
+        self.cross_attention = nn.TransformerDecoder(decoder_layer, num_layers=1)
+
+        self.fc_out = nn.Sequential(
+            nn.Linear(transformer_embedding_size, transformer_embedding_size // 2),
+            nn.ReLU(),
+            nn.Linear(transformer_embedding_size // 2, 1),
+        )
+
+    def forward(self, latent_state, latent_next_state, action, exploration_buffer_seq):
+        # Embed latent state, action, latent next state,
+        current_state_token = self.state_embedding(latent_state)
+        action_token = self.action_embedding(action)
+        next_state_token = self.state_embedding(latent_next_state)
+
+        # Embed + add positional encoding to exploration buffer sequence
+        expl_buffer_token = self.exploration_embedding(exploration_buffer_seq)
+        pos_expl_buffer_token = self.positional_encoding(expl_buffer_token)
+
+        # Create query
+        query = torch.cat([current_state_token, action_token, next_state_token], dim=0)
+
+        # Get cross attention
+        cross_attention_out = self.cross_attention(query, pos_expl_buffer_token)
+        aggregate_cross = cross_attention_out.mean(dim=0)
+        exploration_score = self.fc_out(aggregate_cross).squeeze(-1)
+        return exploration_score
 
     def save(self):
         torch.save(self, f"{run_name}/models/exploration_critic.pt")
