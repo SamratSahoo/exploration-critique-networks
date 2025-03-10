@@ -3,6 +3,7 @@ box2d-py==2.3.5
 cloudpickle==3.1.1
 contourpy==1.3.1
 cycler==0.12.1
+decorator==5.2.1
 docstring_parser==0.16
 Farama-Notifications==0.0.4
 filelock==3.17.0
@@ -10,6 +11,8 @@ fonttools==4.56.0
 fsspec==2025.2.0
 grpcio==1.70.0
 gymnasium==1.0.0
+imageio==2.37.0
+imageio-ffmpeg==0.6.0
 Jinja2==3.1.6
 kiwisolver==1.4.8
 Markdown==3.7
@@ -17,6 +20,7 @@ markdown-it-py==3.0.0
 MarkupSafe==3.0.2
 matplotlib==3.10.1
 mdurl==0.1.2
+moviepy==2.1.2
 mpmath==1.3.0
 networkx==3.4.2
 numpy==2.2.3
@@ -33,14 +37,17 @@ nvidia-cusparselt-cu12==0.6.2
 nvidia-nccl-cu12==2.21.5
 nvidia-nvjitlink-cu12==12.4.127
 nvidia-nvtx-cu12==12.4.127
+opencv-python==4.11.0.86
 packaging==24.2
 pandas==2.2.3
-pillow==11.1.0
+pillow==10.4.0
+proglog==0.1.10
 protobuf==6.30.0
 pygame==2.6.1
 Pygments==2.19.1
 pyparsing==3.2.1
 python-dateutil==2.9.0.post0
+python-dotenv==1.0.1
 pytz==2025.1
 rich==13.9.4
 setuptools==75.8.2
@@ -54,6 +61,7 @@ tensorboard-data-server==0.7.2
 torch==2.6.0
 torchaudio==2.6.0
 torchvision==0.21.0
+tqdm==4.67.1
 triton==3.2.0
 typeguard==4.4.2
 typing_extensions==4.12.2

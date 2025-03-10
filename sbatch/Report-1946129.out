@@ -1,0 +1,9 @@
+---------------------------------------
+Begin Slurm Prolog: Mar-10-2025 14:23:33
+Job ID:    1946129
+User ID:   ssahoo61
+Account:   coc
+Job name:  DDPGTraining
+Partition: coc-cpu
+QOS:       coc-ice
+---------------------------------------
