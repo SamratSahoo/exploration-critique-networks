@@ -13,6 +13,8 @@ import torch.optim as optim
 import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
 from collections import deque, namedtuple
+import math
+from torch.utils.tensorboard import SummaryWriter
 
 import stable_baselines3 as sb3
 
@@ -60,8 +62,6 @@ class Args:
     """timestep to start learning"""
     policy_frequency: int = 2
     """the frequency of training policy (delayed)"""
-    print_log_frequency: int = 100
-    """the frequency of printed_logs"""
     noise_clip: float = 0.5
     """noise clip parameter of the Target Policy Smoothing Regularization"""
 
@@ -70,6 +70,7 @@ args = tyro.cli(Args)
 run_name = f"runs/{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
 os.makedirs(run_name, exist_ok=True)
 os.makedirs(f"{run_name}/models", exist_ok=True)
+os.makedirs(f"{run_name}/logs", exist_ok=True)
 random.seed(args.seed)
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
@@ -77,6 +78,8 @@ torch.backends.cudnn.deterministic = args.torch_deterministic
 
 device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 torch.set_default_device(device)
+
+writer = SummaryWriter(log_dir=f"{run_name}/logs")
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -100,23 +103,35 @@ envs = gym.vector.SyncVectorEnv(
     [make_env(args.env_id, args.seed, 0, args.capture_video, run_name)]
 )
 
+ExplorationBufferElement = namedtuple(
+    "ExplorationBufferElement", "latent_state action latent_next_state"
+)
+
 
 # ALGO LOGIC: initialize agent here:
 class Critic(nn.Module):
     def __init__(self, env):
         super().__init__()
-        self.obs_space_size = np.array(env.single_observation_space.shape).prod()
         self.fc1 = nn.Linear(
-            self.obs_space_size + np.prod(env.single_action_space.shape),
+            np.array(env.single_observation_space.shape).prod()
+            + np.prod(env.single_action_space.shape),
             256,
         )
         self.fc2 = nn.Linear(256, 256)
         self.fc3 = nn.Linear(256, 1)
 
+        self.bn1 = nn.BatchNorm1d(256)
+        self.bn2 = nn.BatchNorm1d(256)
+
     def forward(self, x, a):
         x = torch.cat([x, a], 1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        x = self.fc1(x)
+        x = self.bn1(x)
+        x = F.relu(x)
+
+        x = self.fc2(x)
+        x = self.bn2(x)
+        x = F.relu(x)
         x = self.fc3(x)
         return x
 
@@ -203,9 +218,13 @@ class StateAggregationAutoEncoder(nn.Module):
 
 class Actor(nn.Module):
     def __init__(self, env):
-        super().__init__()
+        super(Actor, self).__init__()
         self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 256)
+        self.bn1 = nn.BatchNorm1d(256)
+
         self.fc2 = nn.Linear(256, 256)
+        self.bn2 = nn.BatchNorm1d(256)
+
         self.fc_mu = nn.Linear(256, np.array(env.single_action_space.shape).prod())
         self.fc_std = nn.Linear(256, np.array(env.single_action_space.shape).prod())
 
@@ -226,8 +245,14 @@ class Actor(nn.Module):
         )
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        x = self.fc1(x)
+        x = self.bn1(x)
+        x = F.relu(x)
+
+        x = self.fc2(x)
+        x = self.bn2(x)
+        x = F.relu(x)
+
         mu = self.fc_mu(x)
         std = F.softplus(self.fc_std(x)) + 1e-6
         return mu, std
@@ -269,16 +294,29 @@ class CompressedActor(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
-    pass
+    def __init__(self, embedding_size, length, dropout=0.1):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        positional_encoding = torch.zeros(length, embedding_size)
+        position = torch.arange(0, length, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, embedding_size, 2) * (-math.log(10000.0) / embedding_size)
+        )
 
+        positional_encoding[:, 0::2] = torch.sin(position * div_term)
+        positional_encoding[:, 1::2] = torch.cos(position * div_term)
 
-ExplorationBufferElement = namedtuple(
-    "ExplorationBufferElement", "latent_state action latent_next_state"
-)
+        positional_encoding = positional_encoding.unsqueeze(1)
+        self.register_buffer("positional_encoding", positional_encoding)
+
+    def forward(self, exploration_buffer_seq):
+        exploration_buffer_seq += self.positional_encoding[
+            : exploration_buffer_seq.size(0)
+        ]
+        return exploration_buffer_seq
 
 
 class ExplorationBuffer:
-
     def __init__(self, maxlen=5000):
         self.buffer = deque(maxlen=maxlen)
 
@@ -320,7 +358,7 @@ class ExplorationCritic(nn.Module):
 
         # Positional encoding layer for exploration buffer
         self.positional_encoding = PositionalEncoding(
-            transformer_embedding_size, length=max_seq_len
+            embedding_size=transformer_embedding_size, length=max_seq_len
         )
 
         # Encoding layer for exploration buffer
@@ -366,6 +404,10 @@ class ExplorationCritic(nn.Module):
 
 
 def train_actor_critic(actor=None, critic=None, total_timesteps=args.total_timesteps):
+
+    def sample_action(action_mean, action_std):
+        return action_mean + action_std * torch.randn_like(action_mean)
+
     assert isinstance(
         envs.single_action_space, gym.spaces.Box
     ), "only continuous action space is supported"
@@ -399,7 +441,10 @@ def train_actor_critic(actor=None, critic=None, total_timesteps=args.total_times
             )
         else:
             with torch.no_grad():
-                actions = actor(torch.Tensor(obs).to(device))
+                actor.eval()
+                mean, std_dev = actor(torch.Tensor(obs).to(device))
+                actor.train()
+                actions = sample_action(mean, std_dev)
                 actions += torch.normal(0, actor.action_scale * args.exploration_noise)
                 actions = (
                     actions.cpu()
@@ -413,7 +458,10 @@ def train_actor_critic(actor=None, critic=None, total_timesteps=args.total_times
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
             with torch.no_grad():
-                next_state_actions = target_actor(data.next_observations)
+                target_actor.eval()
+                mean, std = target_actor(data.next_observations)
+                target_actor.train()
+                next_state_actions = sample_action(mean, std)
                 qf1_next_target = qf1_target(data.next_observations, next_state_actions)
                 next_q_value = data.rewards.flatten() + (
                     1 - data.dones.flatten()
@@ -427,11 +475,17 @@ def train_actor_critic(actor=None, critic=None, total_timesteps=args.total_times
             qf1_loss.backward()
             q_optimizer.step()
 
+            writer.add_scalar("Loss/critic_loss", qf1_loss, global_step)
+            writer.add_scalar("Loss/qf1_values", qf1_a_values.mean(), global_step)
+
             if global_step % args.policy_frequency == 0:
-                actor_loss = -qf1(data.observations, actor(data.observations)).mean()
+                mean, std = actor(data.observations)
+                actor_loss = -qf1(data.observations, sample_action(mean, std)).mean()
                 actor_optimizer.zero_grad()
                 actor_loss.backward()
                 actor_optimizer.step()
+
+                writer.add_scalar("Loss/actor_loss", actor_loss, global_step)
 
                 # update the target network
                 for param, target_param in zip(
@@ -447,9 +501,6 @@ def train_actor_critic(actor=None, critic=None, total_timesteps=args.total_times
                         args.tau * param.data + (1 - args.tau) * target_param.data
                     )
 
-            if global_step % args.print_log_frequency == 0:
-                print(f"Critic Loss: {qf1_loss}, Actor Loss: {actor_loss}")
-
     envs.close()
     target_actor.save()
     qf1_target.save()
@@ -462,14 +513,16 @@ def train_state_aggregation_module(actor, critic):
     SAMPLED_ACTION_COUNT = 1000
     NUM_SAMPLES = 10000
     LEANRING_RATE = 1e-2
-    EPOCHS = 100
+    EPOCHS = 101
     optimizer = torch.optim.Adam(lr=LEANRING_RATE, params=autoencoder.parameters())
 
     def approximate_value(state):
         if isinstance(actor, CompressedActor):
             state = autoencoder.encoder(state)
 
+        actor.eval()
         action_mean, action_std = actor(state)
+        actor.train()
         dist = torch.distributions.Normal(action_mean, action_std)
 
         sampled_actions = dist.sample((SAMPLED_ACTION_COUNT,))
@@ -498,22 +551,21 @@ def train_state_aggregation_module(actor, critic):
         loss.backward()
         optimizer.step()
 
-        if i % args.print_log_frequency == 0:
-            print(f"State Aggregation Autoencoder Loss: {loss}")
+        writer.add_scalar("Loss/state_aggregation_autoencoder_loss", loss, i)
 
     return autoencoder.encoder, autoencoder.decoder, autoencoder
 
 
-#
 def train_exploration_critic(actor, state_aggregation_encoder):
     pass
 
 
 if __name__ == "__main__":
     actor, critic = train_actor_critic()
-
+    state_aggregation_encoder, _, _ = train_state_aggregation_module(actor, critic)
     pipeline_loops = 10
     for i in range(pipeline_loops):
-        state_aggregation_encoder, _, _ = train_state_aggregation_module(actor, critic)
+        # state_aggregation_encoder, _, _ = train_state_aggregation_module(actor, critic)
         # exploration_critic = train_exploration_critic(actor, state_aggregation_encoder)
         # actor, critic = train_actor_critic(actor, critic, exploration_critic)
+        pass

@@ -70,6 +70,10 @@ def make_env(env_id, seed, idx, capture_video, run_name):
     return thunk
 
 
+def sample_action(action_mean, action_std):
+    return action_mean + action_std * torch.randn_like(action_mean)
+
+
 # ALGO LOGIC: initialize agent here:
 class QNetwork(nn.Module):
     def __init__(self, env):
@@ -82,21 +86,33 @@ class QNetwork(nn.Module):
         self.fc2 = nn.Linear(256, 256)
         self.fc3 = nn.Linear(256, 1)
 
+        self.bn1 = nn.BatchNorm1d(256)
+        self.bn2 = nn.BatchNorm1d(256)
+
     def forward(self, x, a):
         x = torch.cat([x, a], 1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        x = self.fc1(x)
+        x = self.bn1(x)
+        x = F.relu(x)
+
+        x = self.fc2(x)
+        x = self.bn2(x)
+        x = F.relu(x)
         x = self.fc3(x)
         return x
 
 
 class Actor(nn.Module):
     def __init__(self, env):
-        super().__init__()
+        super(Actor, self).__init__()
         self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 256)
         self.fc2 = nn.Linear(256, 256)
-        self.fc_mu = nn.Linear(256, np.prod(env.single_action_space.shape))
-        # action rescaling
+        self.fc_mu = nn.Linear(256, np.array(env.single_action_space.shape).prod())
+        self.fc_std = nn.Linear(256, np.array(env.single_action_space.shape).prod())
+
+        self.bn1 = nn.BatchNorm1d(256)
+        self.bn2 = nn.BatchNorm1d(256)
+
         self.register_buffer(
             "action_scale",
             torch.tensor(
@@ -104,6 +120,7 @@ class Actor(nn.Module):
                 dtype=torch.float32,
             ),
         )
+
         self.register_buffer(
             "action_bias",
             torch.tensor(
@@ -113,10 +130,20 @@ class Actor(nn.Module):
         )
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = torch.tanh(self.fc_mu(x))
-        return x * self.action_scale + self.action_bias
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.bn1(x)
+
+        x = self.fc2(x)
+        x = F.relu(x)
+        x = self.bn2(x)
+
+        mu = self.fc_mu(x)
+        std = F.softplus(self.fc_std(x)) + 1e-6
+        return mu, std
+
+    def save(self):
+        torch.save(self, f"{run_name}/models/actor.pt")
 
 
 if __name__ == "__main__":
@@ -183,7 +210,10 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             )
         else:
             with torch.no_grad():
-                actions = actor(torch.Tensor(obs).to(device))
+                actor.eval()
+                mean, std = actor(torch.Tensor(obs).to(device))
+                actor.train()
+                actions = sample_action(mean, std)
                 actions += torch.normal(0, actor.action_scale * args.exploration_noise)
                 actions = (
                     actions.cpu()
@@ -222,7 +252,10 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
             with torch.no_grad():
-                next_state_actions = target_actor(data.next_observations)
+                target_actor.eval()
+                mean, std = target_actor(data.next_observations)
+                target_actor.train()
+                next_state_actions = sample_action(mean, std)
                 qf1_next_target = qf1_target(data.next_observations, next_state_actions)
                 next_q_value = data.rewards.flatten() + (
                     1 - data.dones.flatten()
@@ -237,7 +270,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             q_optimizer.step()
 
             if global_step % args.policy_frequency == 0:
-                actor_loss = -qf1(data.observations, actor(data.observations)).mean()
+                mean, std = actor(data.observations)
+                actor_action = sample_action(mean, std)
+                actor_loss = -qf1(data.observations, actor_action).mean()
                 actor_optimizer.zero_grad()
                 actor_loss.backward()
                 actor_optimizer.step()
