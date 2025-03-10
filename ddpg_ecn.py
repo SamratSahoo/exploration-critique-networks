@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
+from collections import deque, namedtuple
 
 import stable_baselines3 as sb3
 
@@ -121,18 +122,6 @@ class Critic(nn.Module):
 
     def save(self):
         torch.save(self, f"{run_name}/models/critic.pt")
-
-
-class ExplorationCritic(nn.Module):
-
-    def __init__(self):
-        super(ExplorationCritic, self).__init__()
-
-    def forward(self, latent_state, latent_next_state, action):
-        pass
-
-    def save(self):
-        torch.save(self, f"{run_name}/models/exploration_critic.pt")
 
 
 class StateAggregationEncoder(nn.Module):
@@ -279,6 +268,70 @@ class CompressedActor(nn.Module):
         torch.save(self, f"{run_name}/compressed_actor.pt")
 
 
+class PositionalEncoding(nn.Module):
+    pass
+
+
+ExplorationBufferElement = namedtuple("ExplorationBufferElement", "latent_state action")
+
+
+class ExplorationBuffer:
+
+    def __init__(self, maxlen=5000):
+        self.buffer = deque(maxlen=maxlen)
+
+    def add(self, latent_state, action):
+        self.buffer.append(ExplorationBufferElement(latent_state, action))
+
+
+class ExplorationCritic(nn.Module):
+
+    def __init__(
+        self,
+        env,
+        latent_state_size=64,
+        transformer_embedding_size=128,
+        max_seq_len=50,
+        heads=8,
+    ):
+        """
+        Args:
+            latent_state_size (int, optional): Size of latent state created from the State Aggregation Module. Defaults to 64.
+            transformer_embedding_size (int, optional): Size of transformer embedding. Defaults to 128.
+            max_seq_len (int, optional): Number of elements you want to consider from the exploration buffer. Defaults to 50.
+            nheads (int, optional): Number of transformer heads
+        """
+        super(ExplorationCritic, self).__init__()
+        # Embedding for state tokens
+        self.state_embedding = nn.Linear(latent_state_size, transformer_embedding_size)
+        # Embedding for action tokens
+        self.action_embedding = nn.Linear(
+            np.array(env.single_action_space.shape).prod(), transformer_embedding_size
+        )
+        # Embedding for exploration buffer tokens
+        self.exploration_embedding = nn.Linear(
+            latent_state_size + np.array(env.single_action_space.shape).prod(),
+            transformer_embedding_size,
+        )
+
+        # Positional encoding layer for exploration buffer
+        self.positional_encoding = PositionalEncoding(
+            transformer_embedding_size, length=max_seq_len
+        )
+
+        # Encoding layer for exploration buffer
+        encode_layer = nn.TransformerEncoderLayer(
+            d_model=transformer_embedding_size, nhead=heads
+        )
+        self.exploration_transfromer = nn.TransformerEncoder(encode_layer, num_layers=8)
+
+    def forward(self, latent_state, latent_next_state, action):
+        pass
+
+    def save(self):
+        torch.save(self, f"{run_name}/models/exploration_critic.pt")
+
+
 def train_actor_critic(actor=None, critic=None, total_timesteps=args.total_timesteps):
     assert isinstance(
         envs.single_action_space, gym.spaces.Box
@@ -373,30 +426,30 @@ def train_actor_critic(actor=None, critic=None, total_timesteps=args.total_times
 def train_state_aggregation_module(actor, critic):
     autoencoder = StateAggregationAutoEncoder(envs)
     BATCH_SIZE = 64
+    SAMPLED_ACTION_COUNT = 1000
+    NUM_SAMPLES = 10000
+    LEANRING_RATE = 1e-2
+    EPOCHS = 100
+    optimizer = torch.optim.Adam(lr=LEANRING_RATE, params=autoencoder.parameters())
 
-    def approximate_value_function(state):
+    def approximate_value(state):
         if isinstance(actor, CompressedActor):
             state = autoencoder.encoder(state)
 
         action_mean, action_std = actor(state)
         dist = torch.distributions.Normal(action_mean, action_std)
-        # 1000 x 64 x 4
-        sampled_actions = dist.sample((1000,))
-        state = state.unsqueeze(0).expand(1000, -1, -1)
+
+        sampled_actions = dist.sample((SAMPLED_ACTION_COUNT,))
+        state = state.unsqueeze(0).expand(SAMPLED_ACTION_COUNT, -1, -1)
         state = state.reshape(-1, critic.obs_space_size)
 
         sampled_actions = sampled_actions.reshape(-1, 4)
 
         q_values = critic(state, sampled_actions)
-        q_values = q_values.view(1000, 64, -1).mean(dim=0)
+        q_values = q_values.view(SAMPLED_ACTION_COUNT, 64, -1).mean(dim=0)
 
         return torch.tensor(q_values, device=device)
 
-    NUM_SAMPLES = 10000
-    LEANRING_RATE = 1e-2
-    EPOCHS = 100
-
-    optimizer = torch.optim.Adam(lr=LEANRING_RATE, params=autoencoder.parameters())
     dataset = [envs.single_observation_space.sample() for i in range(NUM_SAMPLES)]
     loss_fn = nn.MSELoss()
 
@@ -404,7 +457,7 @@ def train_state_aggregation_module(actor, critic):
         sample = torch.tensor(
             random.sample(dataset, BATCH_SIZE), dtype=torch.float32, device=device
         )
-        value = approximate_value_function(sample)
+        value = approximate_value(sample)
         autoencoder_out = autoencoder(sample, value)
         loss = loss_fn(autoencoder_out, sample)
 
@@ -418,6 +471,7 @@ def train_state_aggregation_module(actor, critic):
     return autoencoder.encoder, autoencoder.decoder, autoencoder
 
 
+#
 def train_exploration_critic(actor, state_aggregation_encoder):
     pass
 
