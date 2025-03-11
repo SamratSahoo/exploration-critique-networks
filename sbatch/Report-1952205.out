@@ -1,0 +1,34 @@
+---------------------------------------
+Begin Slurm Prolog: Mar-10-2025 16:25:27
+Job ID:    1952205
+User ID:   ssahoo61
+Account:   coc
+Job name:  ECNTraining
+Partition: coc-cpu
+QOS:       coc-ice
+---------------------------------------
+/home/hice1/ssahoo61/Documents/exploration-critique-networks/venv/lib/python3.10/site-packages/torch/utils/_device.py:104: UserWarning: Creating a tensor from a list of numpy.ndarrays is extremely slow. Please consider converting the list to a single numpy.ndarray with numpy.array() before converting to a tensor. (Triggered internally at /pytorch/torch/csrc/utils/tensor_new.cpp:254.)
+  return func(*args, **kwargs)
+Traceback (most recent call last):
+  File "/home/hice1/ssahoo61/Documents/exploration-critique-networks/ddpg_ecn.py", line 565, in <module>
+    state_aggregation_encoder, _, _ = train_state_aggregation_module(actor, critic)
+  File "/home/hice1/ssahoo61/Documents/exploration-critique-networks/ddpg_ecn.py", line 546, in train_state_aggregation_module
+    value = approximate_value(sample)
+  File "/home/hice1/ssahoo61/Documents/exploration-critique-networks/ddpg_ecn.py", line 530, in approximate_value
+    state = state.reshape(-1, critic.obs_space_size)
+  File "/home/hice1/ssahoo61/Documents/exploration-critique-networks/venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1928, in __getattr__
+    raise AttributeError(
+AttributeError: 'Critic' object has no attribute 'obs_space_size'
+srun: error: atl1-1-02-010-1-1: task 0: Exited with exit code 1
+---------------------------------------
+Begin Slurm Epilog: Mar-10-2025 18:29:34
+Job ID:        1952205
+User ID:       ssahoo61
+Account:       coc
+Job name:      ECNTraining
+Resources:     cpu=4,mem=32G,node=1
+Rsrc Used:     cput=08:16:28,vmem=0,walltime=02:04:07,mem=7452K,energy_used=0
+Partition:     coc-cpu
+QOS:           coc-ice
+Nodes:         atl1-1-02-010-1-1
+---------------------------------------

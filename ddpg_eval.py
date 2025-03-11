@@ -5,6 +5,10 @@ import torch
 import torch.nn as nn
 
 
+
+def sample_action(action_mean, action_std):
+    return action_mean + action_std * torch.randn_like(action_mean)
+
 def evaluate(
     model_path: str,
     make_env: Callable,
@@ -30,7 +34,8 @@ def evaluate(
     episodic_returns = []
     while len(episodic_returns) < eval_episodes:
         with torch.no_grad():
-            actions = actor(torch.Tensor(obs).to(device))
+            mean, std = actor(torch.Tensor(obs).to(device))
+            actions = sample_action(mean, std)
             actions += torch.normal(0, actor.action_scale * exploration_noise)
             actions = (
                 actions.cpu()

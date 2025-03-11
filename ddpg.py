@@ -35,21 +35,21 @@ class Args:
     """the environment id of the Atari game"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
-    learning_rate: float = 3e-4
+    learning_rate: float = 3e-3
     """the learning rate of the optimizer"""
     buffer_size: int = int(1e6)
     """the replay memory buffer size"""
     gamma: float = 0.99
     """the discount factor gamma"""
-    tau: float = 0.005
+    tau: float = 0.01
     """target smoothing coefficient (default: 0.005)"""
     batch_size: int = 256
-    """the batch size of sample from the reply memory"""
+    """the batch size of sample from the replay memory"""
     exploration_noise: float = 0.1
     """the scale of exploration noise"""
     learning_starts: int = 25e3
     """timestep to start learning"""
-    policy_frequency: int = 2
+    policy_frequency: int = 10
     """the frequency of training policy (delayed)"""
     noise_clip: float = 0.5
     """noise clip parameter of the Target Policy Smoothing Regularization"""
@@ -214,7 +214,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 mean, std = actor(torch.Tensor(obs).to(device))
                 actor.train()
                 actions = sample_action(mean, std)
-                actions += torch.normal(0, actor.action_scale * args.exploration_noise)
+                # actions += torch.normal(0, actor.action_scale * args.exploration_noise)
                 actions = (
                     actions.cpu()
                     .numpy()
