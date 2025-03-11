@@ -105,12 +105,12 @@ class StateValueApproximator(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(
             np.array(env.single_observation_space.shape).prod(),
-            256,
+            512,
         )
-        self.fc2 = nn.Linear(256, 256)
+        self.fc2 = nn.Linear(512, 256)
         self.fc3 = nn.Linear(256, 1)
 
-        self.bn1 = nn.BatchNorm1d(256)
+        self.bn1 = nn.BatchNorm1d(512)
         self.bn2 = nn.BatchNorm1d(256)
         
     def forward(self, state):
@@ -456,7 +456,7 @@ def train_state_value_network():
     state_value_net.save()
     return state_value_net
 
-def train_actor_critic(actor=None, critic=None, total_timesteps=args.total_timesteps):
+def train_actor_critic(state_aggregation_encoder, state_value_net, actor=None, qf1=None, total_timesteps=args.total_timesteps):
 
     assert isinstance(
         envs.single_action_space, gym.spaces.Box
@@ -466,11 +466,18 @@ def train_actor_critic(actor=None, critic=None, total_timesteps=args.total_times
         actor = Actor(envs).to(device)
         target_actor = Actor(envs).to(device)
         target_actor.load_state_dict(actor.state_dict())
+    else:
+        target_actor = Actor(envs).to(device)
+        target_actor.load_state_dict(actor.state_dict())
 
-    if not critic:
+    if not qf1:
         qf1 = Critic(envs).to(device)
         qf1_target = Critic(envs).to(device)
         qf1_target.load_state_dict(qf1.state_dict())
+    else:
+        qf1_target = Critic(envs).to(device)
+        qf1_target.load_state_dict(qf1.state_dict())
+
 
     q_optimizer = optim.Adam(list(qf1.parameters()), lr=args.learning_rate)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.learning_rate)
@@ -484,6 +491,8 @@ def train_actor_critic(actor=None, critic=None, total_timesteps=args.total_times
     )
 
     obs, _ = envs.reset(seed=args.seed)
+    value = state_value_net(torch.tensor(obs))
+    encoded_obs = state_aggregation_encoder(obs, value)
     for global_step in range(total_timesteps):
         if global_step < args.learning_starts:
             actions = np.array(
@@ -492,7 +501,7 @@ def train_actor_critic(actor=None, critic=None, total_timesteps=args.total_times
         else:
             with torch.no_grad():
                 actor.eval()
-                actions = actor(torch.Tensor(obs).to(device))
+                actions = actor(torch.Tensor(encoded_obs).to(device))
                 actor.train()
                 actions += torch.normal(0, actor.action_scale * args.exploration_noise)
                 actions = (
@@ -503,12 +512,17 @@ def train_actor_critic(actor=None, critic=None, total_timesteps=args.total_times
 
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
         rb.add(obs, next_obs, actions, rewards, terminations, infos)
+        
 
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
             with torch.no_grad():
                 target_actor.eval()
-                next_state_actions = target_actor(data.next_observations)
+                
+                next_values = state_value_net(torch.tensor(data.next_observations))
+                encoded_next_obs = state_aggregation_encoder(data.next_observations, next_values)
+                next_state_actions = target_actor(encoded_next_obs)
+                
                 target_actor.train()
                 qf1_next_target = qf1_target(data.next_observations, next_state_actions)
                 next_q_value = data.rewards.flatten() + (
@@ -527,7 +541,11 @@ def train_actor_critic(actor=None, critic=None, total_timesteps=args.total_times
             writer.add_scalar("Loss/qf1_values", qf1_a_values.mean(), global_step)
 
             if global_step % args.policy_frequency == 0:
-                actor_loss = -qf1(data.observations, actor(data.observations)).mean()
+                
+                next_values = state_value_net(torch.tensor(data.next_observations))
+                encoded_next_obs = state_aggregation_encoder(data.next_observations, next_values)
+
+                actor_loss = -qf1(data.observations, actor(encoded_next_obs)).mean()
                 actor_optimizer.zero_grad()
                 actor_loss.backward()
                 actor_optimizer.step()
@@ -553,7 +571,6 @@ def train_actor_critic(actor=None, critic=None, total_timesteps=args.total_times
     qf1_target.save()
     return target_actor, qf1_target
 
-
 def train_state_aggregation_module(state_value_net):
     autoencoder = StateAggregationAutoencoder(envs)
     BATCH_SIZE = 64
@@ -570,7 +587,7 @@ def train_state_aggregation_module(state_value_net):
         sample = torch.tensor(
             random.sample(dataset, BATCH_SIZE), dtype=torch.float32, device=device
         )
-        value = approximate_value(sample)
+        value = state_value_net(sample)
         autoencoder_out = autoencoder(sample, value)
         loss = loss_fn(autoencoder_out, sample)
 
@@ -582,7 +599,6 @@ def train_state_aggregation_module(state_value_net):
 
     return autoencoder.encoder, autoencoder.decoder, autoencoder
 
-
 def train_exploration_critic(actor, state_aggregation_encoder):
     pass
 
@@ -591,7 +607,7 @@ if __name__ == "__main__":
     state_value_network = train_state_value_network()
     state_aggregation_encoder, _, _ = train_state_aggregation_module(state_value_network)
 
-    actor, critic = train_actor_critic()
+    actor, critic = train_actor_critic(state_aggregation_encoder, state_value_network)
     
     pipeline_loops = 10
     for i in range(pipeline_loops):
