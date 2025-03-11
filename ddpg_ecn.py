@@ -165,7 +165,7 @@ class StateAggregationEncoder(nn.Module):
         super(StateAggregationEncoder, self).__init__()
         self.latent_size = latent_size
 
-        # Input Shape is flattened state space + Q Value
+        # Input Shape is flattened state space + State Value
         self.fc1 = nn.Linear(
             np.array(env.single_observation_space.shape).prod() + 1, 256
         )
@@ -176,7 +176,7 @@ class StateAggregationEncoder(nn.Module):
         self.batch_norm_3 = nn.BatchNorm1d(self.latent_size)
 
     def forward(self, state, value):
-        x = self.fc1(torch.tensor(torch.hstack((state, value)), device=device))
+        x = self.fc1(torch.tensor(torch.hstack((state, value)), device=device, dtype=torch.float))
         x = self.batch_norm_1(x)
         x = F.relu(x)
 
@@ -229,13 +229,12 @@ class StateAggregationAutoencoder(nn.Module):
         self.decoder = StateAggregationDecoder(env, latent_size=latent_size)
 
     def forward(self, state, value):
-        return self.decoder(torch.tensor(self.encoder(state, value), device=device))
+        return self.decoder(torch.tensor(self.encoder(state, value), device=device, dtype=torch.float))
 
     def save(self):
         self.encoder.save()
         self.decoder.save()
         torch.save(self, f"{run_name}/models/state_aggregation_autoencoder.pt")
-
 
 # Actor by default works in latent space
 class Actor(nn.Module):
@@ -252,16 +251,14 @@ class Actor(nn.Module):
         self.register_buffer(
             "action_scale",
             torch.tensor(
-                (env.action_space.high - env.action_space.low) / 2.0,
-                dtype=torch.float32,
+                (env.action_space.high - env.action_space.low) / 2.0, dtype=torch.float
             ),
         )
 
         self.register_buffer(
             "action_bias",
             torch.tensor(
-                (env.action_space.high + env.action_space.low) / 2.0,
-                dtype=torch.float32,
+                (env.action_space.high + env.action_space.low) / 2.0, dtype=torch.float
             ),
         )
 
@@ -392,9 +389,9 @@ class ExplorationCritic(nn.Module):
 
 
 def train_state_value_network():
-    NUM_EPISODES = 100
+    NUM_EPISODES = 1000
     BATCH_SIZE = 128
-    EPOCHS = 100
+    EPOCHS = 10000
 
     def generate_rollouts(num_episodes=NUM_EPISODES, gamma=args.gamma):
         all_states = []
@@ -431,8 +428,8 @@ def train_state_value_network():
         return all_states, all_returns
 
     states_np, returns_np = generate_rollouts()
-    states_tensor = torch.tensor(states_np, dtype=torch.float32, device=device)
-    returns_tensor = torch.tensor(returns_np, dtype=torch.float32, device=device)
+    states_tensor = torch.tensor(states_np, device=device, dtype=torch.float)
+    returns_tensor = torch.tensor(returns_np, device=device, dtype=torch.float)
 
     dataset = TensorDataset(states_tensor, returns_tensor)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
@@ -457,7 +454,8 @@ def train_state_value_network():
     return state_value_net
 
 def train_actor_critic(state_aggregation_encoder, state_value_net, actor=None, qf1=None, total_timesteps=args.total_timesteps):
-
+    state_value_net.eval()
+    state_aggregation_encoder.eval()
     assert isinstance(
         envs.single_action_space, gym.spaces.Box
     ), "only continuous action space is supported"
@@ -491,8 +489,8 @@ def train_actor_critic(state_aggregation_encoder, state_value_net, actor=None, q
     )
 
     obs, _ = envs.reset(seed=args.seed)
-    value = state_value_net(torch.tensor(obs))
-    encoded_obs = state_aggregation_encoder(obs, value)
+    value = state_value_net(torch.tensor(obs, dtype=torch.float))
+    encoded_obs = state_aggregation_encoder(torch.tensor(obs, dtype=torch.float), value)
     for global_step in range(total_timesteps):
         if global_step < args.learning_starts:
             actions = np.array(
@@ -501,7 +499,7 @@ def train_actor_critic(state_aggregation_encoder, state_value_net, actor=None, q
         else:
             with torch.no_grad():
                 actor.eval()
-                actions = actor(torch.Tensor(encoded_obs).to(device))
+                actions = actor(torch.tensor(encoded_obs, dtype=torch.float).to(device))
                 actor.train()
                 actions += torch.normal(0, actor.action_scale * args.exploration_noise)
                 actions = (
@@ -519,7 +517,7 @@ def train_actor_critic(state_aggregation_encoder, state_value_net, actor=None, q
             with torch.no_grad():
                 target_actor.eval()
                 
-                next_values = state_value_net(torch.tensor(data.next_observations))
+                next_values = state_value_net(torch.tensor(data.next_observations, dtype=torch.float))
                 encoded_next_obs = state_aggregation_encoder(data.next_observations, next_values)
                 next_state_actions = target_actor(encoded_next_obs)
                 
@@ -542,7 +540,7 @@ def train_actor_critic(state_aggregation_encoder, state_value_net, actor=None, q
 
             if global_step % args.policy_frequency == 0:
                 
-                next_values = state_value_net(torch.tensor(data.next_observations))
+                next_values = state_value_net(torch.tensor(data.next_observations, dtype=torch.float))
                 encoded_next_obs = state_aggregation_encoder(data.next_observations, next_values)
 
                 actor_loss = -qf1(data.observations, actor(encoded_next_obs)).mean()
@@ -569,15 +567,19 @@ def train_actor_critic(state_aggregation_encoder, state_value_net, actor=None, q
     envs.close()
     target_actor.save()
     qf1_target.save()
+    state_value_net.train()
+    state_aggregation_encoder.train()
     return target_actor, qf1_target
 
 def train_state_aggregation_module(state_value_net):
+    state_value_net.eval()
+    
     autoencoder = StateAggregationAutoencoder(envs)
     BATCH_SIZE = 64
     SAMPLED_ACTION_COUNT = 1000
     NUM_SAMPLES = 10000
     LEANRING_RATE = 1e-2
-    EPOCHS = 101
+    EPOCHS = 10000
     optimizer = torch.optim.Adam(lr=LEANRING_RATE, params=autoencoder.parameters())
 
     dataset = [envs.single_observation_space.sample() for i in range(NUM_SAMPLES)]
@@ -585,7 +587,7 @@ def train_state_aggregation_module(state_value_net):
 
     for i in range(EPOCHS):
         sample = torch.tensor(
-            random.sample(dataset, BATCH_SIZE), dtype=torch.float32, device=device
+            random.sample(dataset, BATCH_SIZE), device=device, dtype=torch.float
         )
         value = state_value_net(sample)
         autoencoder_out = autoencoder(sample, value)
@@ -596,7 +598,8 @@ def train_state_aggregation_module(state_value_net):
         optimizer.step()
 
         writer.add_scalar("Loss/state_aggregation_autoencoder_loss", loss, i)
-
+    
+    state_value_net.train()
     return autoencoder.encoder, autoencoder.decoder, autoencoder
 
 def train_exploration_critic(actor, state_aggregation_encoder):

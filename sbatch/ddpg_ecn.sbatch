@@ -2,7 +2,7 @@
 #SBATCH -JECNTraining
 #SBATCH -N1 --ntasks-per-node=1
 #SBATCH --mem-per-cpu=8G --cpus-per-task=4
-#SBATCH --time=17:59:59
+#SBATCH --time=18:00:00
 #SBATCH -q coc-ice
 #SBATCH -oReport-%j.out
 #SBATCH --mail-type=BEGIN,END,FAIL
