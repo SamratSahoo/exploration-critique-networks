@@ -67,6 +67,7 @@ os.makedirs(run_name, exist_ok=True)
 os.makedirs(f"{run_name}/models", exist_ok=True)
 os.makedirs(f"{run_name}/logs", exist_ok=True)
 os.makedirs(f"{run_name}/videos", exist_ok=True)
+os.makedirs(f"{run_name}/eval", exist_ok=True)
 random.seed(args.seed)
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
@@ -81,7 +82,7 @@ writer = SummaryWriter(log_dir=f"{run_name}/logs")
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
         if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
+            env = gym.make(env_id, render_mode="rgb_array", terminate_when_unhealthy=False)
             env = gym.wrappers.RecordVideo(
                 env, f"{run_name}/videos"
             )
@@ -476,11 +477,11 @@ def train_actor_critic(state_aggregation_encoder, state_value_net, actor=None, q
     ), "only continuous action space is supported"
 
     if not actor:
-        actor = Actor(envs).to(device)
-        target_actor = Actor(envs).to(device)
+        actor = Actor(envs, latent_size=state_aggregation_encoder.latent_size).to(device)
+        target_actor = Actor(envs, latent_size=state_aggregation_encoder.latent_size).to(device)
         target_actor.load_state_dict(actor.state_dict())
     else:
-        target_actor = Actor(envs).to(device)
+        target_actor = Actor(envs, latent_size=state_aggregation_encoder.latent_size).to(device)
         target_actor.load_state_dict(actor.state_dict())
 
     if not qf1:
@@ -615,7 +616,7 @@ def train_actor_critic(state_aggregation_encoder, state_value_net, actor=None, q
 def train_state_aggregation_module(state_value_net):
     state_value_net.eval()
     
-    autoencoder = StateAggregationAutoencoder(envs)
+    autoencoder = StateAggregationAutoencoder(envs, latent_size=np.array(envs.single_observation_space.shape).prod() // 2)
     BATCH_SIZE = 64
     NUM_SAMPLES = 10000
     LEANRING_RATE = 1e-2

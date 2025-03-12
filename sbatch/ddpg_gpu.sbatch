@@ -1,11 +1,9 @@
 #!/bin/bash
 #SBATCH -JGPUDDPGTraining
-#SBATCH -N1 --gres=gpu:A100:1
+#SBATCH -N1 --gres=gpu:1 -C A100-40GB
 #SBATCH --time=16:00:00
 #SBATCH -q coc-ice
 #SBATCH -oReport-%j.out
-#SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH --mail-user=ssahoo61@gatech.edu
 
 module load anaconda3/2023.03
 source activate ecn

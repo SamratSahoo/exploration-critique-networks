@@ -59,7 +59,7 @@ class Args:
 def make_env(env_id, seed, idx, capture_video, run_name, is_eval=False):
     def thunk():
         if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
+            env = gym.make(env_id, render_mode="rgb_array", terminate_when_unhealthy=False)
             if is_eval:
                 env = gym.wrappers.RecordVideo(env, f"{run_name}/eval")            
             else:
@@ -122,6 +122,7 @@ if __name__ == "__main__":
     os.makedirs(f"{run_name}/models", exist_ok=True)
     os.makedirs(f"{run_name}/logs", exist_ok=True)
     os.makedirs(f"{run_name}/videos", exist_ok=True)
+    os.makedirs(f"{run_name}/eval", exist_ok=True)
 
     writer = SummaryWriter(f"{run_name}/logs")
     writer.add_text(

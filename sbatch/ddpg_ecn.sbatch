@@ -5,8 +5,6 @@
 #SBATCH --time=18:00:00
 #SBATCH -q coc-ice
 #SBATCH -oReport-%j.out
-#SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH --mail-user=ssahoo61@gatech.edu
 
 module load anaconda3/2023.03
 source activate ecn
