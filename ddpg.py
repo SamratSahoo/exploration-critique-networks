@@ -14,6 +14,7 @@ import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 
+os.environ['MUJOCO_GL'] = 'osmesa'
 
 @dataclass
 class Args:
@@ -31,25 +32,25 @@ class Args:
     """whether to save model into the `runs/{run_name}` folder"""
 
     # Algorithm specific arguments
-    env_id: str = "BipedalWalker-v3"
+    env_id: str = "Hopper-v5"
     """the environment id of the Atari game"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
-    learning_rate: float = 3e-3
+    learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
     buffer_size: int = int(1e6)
     """the replay memory buffer size"""
     gamma: float = 0.99
     """the discount factor gamma"""
-    tau: float = 0.01
+    tau: float = 0.005
     """target smoothing coefficient (default: 0.005)"""
     batch_size: int = 256
-    """the batch size of sample from the replay memory"""
+    """the batch size of sample from the reply memory"""
     exploration_noise: float = 0.1
     """the scale of exploration noise"""
     learning_starts: int = 25e3
     """timestep to start learning"""
-    policy_frequency: int = 10
+    policy_frequency: int = 2
     """the frequency of training policy (delayed)"""
     noise_clip: float = 0.5
     """noise clip parameter of the Target Policy Smoothing Regularization"""
@@ -69,78 +70,41 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
     return thunk
 
-
-def sample_action(action_mean, action_std):
-    return action_mean + action_std * torch.randn_like(action_mean)
-
-
 # ALGO LOGIC: initialize agent here:
 class QNetwork(nn.Module):
     def __init__(self, env):
         super().__init__()
-        self.fc1 = nn.Linear(
-            np.array(env.single_observation_space.shape).prod()
-            + np.prod(env.single_action_space.shape),
-            256,
-        )
+        self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape), 256)
         self.fc2 = nn.Linear(256, 256)
         self.fc3 = nn.Linear(256, 1)
 
-        self.bn1 = nn.BatchNorm1d(256)
-        self.bn2 = nn.BatchNorm1d(256)
-
     def forward(self, x, a):
         x = torch.cat([x, a], 1)
-        x = self.fc1(x)
-        x = self.bn1(x)
-        x = F.relu(x)
-
-        x = self.fc2(x)
-        x = self.bn2(x)
-        x = F.relu(x)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
 
 
 class Actor(nn.Module):
     def __init__(self, env):
-        super(Actor, self).__init__()
+        super().__init__()
         self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 256)
         self.fc2 = nn.Linear(256, 256)
-        self.fc_mu = nn.Linear(256, np.array(env.single_action_space.shape).prod())
-        self.fc_std = nn.Linear(256, np.array(env.single_action_space.shape).prod())
-
-        self.bn1 = nn.BatchNorm1d(256)
-        self.bn2 = nn.BatchNorm1d(256)
-
+        self.fc_mu = nn.Linear(256, np.prod(env.single_action_space.shape))
+        
         self.register_buffer(
-            "action_scale",
-            torch.tensor(
-                (env.action_space.high - env.action_space.low) / 2.0,
-                dtype=torch.float32,
-            ),
+            "action_scale", torch.tensor((env.action_space.high - env.action_space.low) / 2.0, dtype=torch.float32)
         )
-
         self.register_buffer(
-            "action_bias",
-            torch.tensor(
-                (env.action_space.high + env.action_space.low) / 2.0,
-                dtype=torch.float32,
-            ),
+            "action_bias", torch.tensor((env.action_space.high + env.action_space.low) / 2.0, dtype=torch.float32)
         )
 
     def forward(self, x):
-        x = self.fc1(x)
-        x = F.relu(x)
-        x = self.bn1(x)
-
-        x = self.fc2(x)
-        x = F.relu(x)
-        x = self.bn2(x)
-
-        mu = self.fc_mu(x)
-        std = F.softplus(self.fc_std(x)) + 1e-6
-        return mu, std
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = torch.tanh(self.fc_mu(x))
+        return x * self.action_scale + self.action_bias
 
     def save(self):
         torch.save(self, f"{run_name}/models/actor.pt")
@@ -149,12 +113,6 @@ class Actor(nn.Module):
 if __name__ == "__main__":
     import stable_baselines3 as sb3
 
-    if sb3.__version__ < "2.0":
-        raise ValueError(
-            """Ongoing migration: run the following command to install the new dependencies:
-poetry run pip install "stable_baselines3==2.0.0a1"
-"""
-        )
     args = tyro.cli(Args)
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
 
@@ -210,17 +168,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             )
         else:
             with torch.no_grad():
-                actor.eval()
-                mean, std = actor(torch.Tensor(obs).to(device))
-                actor.train()
-                actions = sample_action(mean, std)
-                # actions += torch.normal(0, actor.action_scale * args.exploration_noise)
-                actions = (
-                    actions.cpu()
-                    .numpy()
-                    .clip(envs.single_action_space.low, envs.single_action_space.high)
-                )
-
+                actions = actor(torch.Tensor(obs).to(device))
+                actions += torch.normal(0, actor.action_scale * args.exploration_noise)
+                actions = actions.cpu().numpy().clip(envs.single_action_space.low, envs.single_action_space.high)
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
@@ -240,9 +190,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
-        # for idx, trunc in enumerate(truncations):
-        #     if trunc:
-        #         real_next_obs[idx] = infos["final_observation"][idx]
+        for idx, trunc in enumerate(truncations):
+            if trunc:
+                real_next_obs[idx] = infos["final_observation"][idx]
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
@@ -252,15 +202,10 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
             with torch.no_grad():
-                target_actor.eval()
-                mean, std = target_actor(data.next_observations)
-                target_actor.train()
-                next_state_actions = sample_action(mean, std)
+                next_state_actions = target_actor(data.next_observations)
                 qf1_next_target = qf1_target(data.next_observations, next_state_actions)
-                next_q_value = data.rewards.flatten() + (
-                    1 - data.dones.flatten()
-                ) * args.gamma * (qf1_next_target).view(-1)
-
+                next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (qf1_next_target).view(-1)
+                
             qf1_a_values = qf1(data.observations, data.actions).view(-1)
             qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
 
@@ -270,8 +215,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             q_optimizer.step()
 
             if global_step % args.policy_frequency == 0:
-                mean, std = actor(data.observations)
-                actor_action = sample_action(mean, std)
+                actor_action = actor(data.observations)
                 actor_loss = -qf1(data.observations, actor_action).mean()
                 actor_optimizer.zero_grad()
                 actor_loss.backward()

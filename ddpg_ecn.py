@@ -19,6 +19,8 @@ from torch.utils.data import TensorDataset, DataLoader
 
 import stable_baselines3 as sb3
 
+os.environ['MUJOCO_GL'] = 'osmesa'
+
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
@@ -35,25 +37,25 @@ class Args:
     """whether to save model into the `runs/{run_name}` folder"""
 
     # Algorithm specific arguments
-    env_id: str = "BipedalWalker-v3"
+    env_id: str = "Hopper-v5"
     """the environment id of the Atari game"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
-    learning_rate: float = 3e-3
+    learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
     buffer_size: int = int(1e6)
     """the replay memory buffer size"""
     gamma: float = 0.99
     """the discount factor gamma"""
-    tau: float = 0.01
+    tau: float = 0.005
     """target smoothing coefficient (default: 0.005)"""
     batch_size: int = 256
-    """the batch size of sample from the replay memory"""
+    """the batch size of sample from the reply memory"""
     exploration_noise: float = 0.1
     """the scale of exploration noise"""
     learning_starts: int = 25e3
     """timestep to start learning"""
-    policy_frequency: int = 10
+    policy_frequency: int = 2
     """the frequency of training policy (delayed)"""
     noise_clip: float = 0.5
     """noise clip parameter of the Target Policy Smoothing Regularization"""
@@ -391,7 +393,7 @@ class ExplorationCritic(nn.Module):
 def train_state_value_network():
     NUM_EPISODES = 1000
     BATCH_SIZE = 128
-    EPOCHS = 10000
+    EPOCHS = 1000
 
     def generate_rollouts(num_episodes=NUM_EPISODES, gamma=args.gamma):
         all_states = []
@@ -432,7 +434,8 @@ def train_state_value_network():
     returns_tensor = torch.tensor(returns_np, device=device, dtype=torch.float)
 
     dataset = TensorDataset(states_tensor, returns_tensor)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
+                            generator=torch.Generator(device='cuda'))
 
     state_value_net = StateValueApproximator(envs).to(device)
     optimizer = optim.Adam(state_value_net.parameters(), lr=args.learning_rate)
@@ -576,10 +579,9 @@ def train_state_aggregation_module(state_value_net):
     
     autoencoder = StateAggregationAutoencoder(envs)
     BATCH_SIZE = 64
-    SAMPLED_ACTION_COUNT = 1000
     NUM_SAMPLES = 10000
     LEANRING_RATE = 1e-2
-    EPOCHS = 10000
+    EPOCHS = 1000
     optimizer = torch.optim.Adam(lr=LEANRING_RATE, params=autoencoder.parameters())
 
     dataset = [envs.single_observation_space.sample() for i in range(NUM_SAMPLES)]

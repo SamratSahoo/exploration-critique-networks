@@ -1,8 +1,7 @@
 #!/bin/bash
-#SBATCH -JECNTraining
-#SBATCH -N1 --ntasks-per-node=1
-#SBATCH --mem-per-cpu=16G --cpus-per-task=1
-#SBATCH --time=18:00:00
+#SBATCH -JGPUECNTraining
+#SBATCH -N1 --gres=gpu:A100:1
+#SBATCH --time=16:00:00
 #SBATCH -q coc-ice
 #SBATCH -oReport-%j.out
 #SBATCH --mail-type=BEGIN,END,FAIL
