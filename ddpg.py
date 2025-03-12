@@ -56,11 +56,14 @@ class Args:
     """noise clip parameter of the Target Policy Smoothing Regularization"""
 
 
-def make_env(env_id, seed, idx, capture_video, run_name):
+def make_env(env_id, seed, idx, capture_video, run_name, is_eval=False):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"{run_name}/videos")
+            if is_eval:
+                env = gym.wrappers.RecordVideo(env, f"{run_name}/eval")            
+            else:
+                env = gym.wrappers.RecordVideo(env, f"{run_name}/videos")
             env.recorded_frames = []
         else:
             env = gym.make(env_id)
@@ -196,9 +199,8 @@ if __name__ == "__main__":
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
-        for idx, trunc in enumerate(truncations):
-            if trunc:
-                print(infos)
+        for idx, is_done in enumerate(np.logical_or(terminations, truncations)):
+            if is_done:
                 real_next_obs[idx] = infos["final_obs"][idx]
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
 
@@ -248,7 +250,6 @@ if __name__ == "__main__":
                 )
                 writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
-                print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar(
                     "charts/SPS",
                     int(global_step / (time.time() - start_time)),
@@ -266,7 +267,7 @@ if __name__ == "__main__":
             make_env,
             args.env_id,
             eval_episodes=10,
-            run_name=f"{run_name}-eval",
+            run_name=f"{run_name}",
             Model=(Actor, QNetwork),
             device=device,
             exploration_noise=args.exploration_noise,

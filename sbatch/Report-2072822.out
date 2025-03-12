@@ -1,0 +1,14 @@
+---------------------------------------
+Begin Slurm Prolog: Mar-12-2025 10:24:04
+Job ID:    2072822
+User ID:   ssahoo61
+Account:   coc
+Job name:  GPUECNTraining
+Partition: coc-gpu
+QOS:       coc-ice
+---------------------------------------
+
+CondaError: Run 'conda init' before 'conda deactivate'
+
+/home/hice1/ssahoo61/.conda/envs/ecn/lib/python3.12/site-packages/gymnasium/wrappers/rendering.py:283: UserWarning: [33mWARN: Overwriting existing videos at /home/hice1/ssahoo61/Documents/exploration-critique-networks/runs/Hopper-v5__ddpg_ecn__1__1741789454/videos folder (try specifying a different `video_folder` for the `RecordVideo` wrapper if this is not desired)[0m
+  logger.warn(

@@ -393,7 +393,7 @@ class ExplorationCritic(nn.Module):
 
 
 def train_state_value_network():
-    NUM_EPISODES = 1000
+    NUM_EPISODES = 10000
     BATCH_SIZE = 128
     EPOCHS = 1000
 
@@ -411,13 +411,12 @@ def train_state_value_network():
             actions = np.array(
                 [envs.single_action_space.sample() for _ in range(envs.num_envs)]
             )
-            episode_states.append(obs)
             next_obs, rewards, terminations, truncations, infos = envs.step(actions)
             done = np.logical_or(terminations, truncations)          
             episode_states.append(obs)
             episode_rewards.append(rewards)
             
-            real_next_obs = next_obs.copy()
+            obs = next_obs
             for idx, is_done in enumerate(done):
                 if is_done:
                     episode_states = np.array(episode_states)
@@ -448,7 +447,7 @@ def train_state_value_network():
 
     dataset = TensorDataset(states_tensor, returns_tensor)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
-                            generator=torch.Generator(device='cuda'))
+                            generator=torch.Generator(device=device))
 
     state_value_net = StateValueApproximator(envs).to(device)
     optimizer = optim.Adam(state_value_net.parameters(), lr=args.learning_rate)
@@ -544,7 +543,7 @@ def train_actor_critic(state_aggregation_encoder, state_value_net, actor=None, q
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
-        for idx, trunc in enumerate(truncations):
+        for idx, trunc in enumerate(np.logical_or(terminations, truncations)):
             if trunc:
                 real_next_obs[idx] = infos["final_obs"][idx]
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
@@ -585,7 +584,7 @@ def train_actor_critic(state_aggregation_encoder, state_value_net, actor=None, q
                 next_values = state_value_net(torch.tensor(data.next_observations, dtype=torch.float32))
                 encoded_next_obs = state_aggregation_encoder(data.next_observations, next_values)
 
-                actor_loss = -qf1(data.observations, actor(encoded_next_obs)).mean()
+                actor_loss = -qf1(torch.tensor(data.observations, dtype=torch.float32), torch.tensor(actor(encoded_next_obs), dtype=torch.float32)).mean()
                 actor_optimizer.zero_grad()
                 actor_loss.backward()
                 actor_optimizer.step()

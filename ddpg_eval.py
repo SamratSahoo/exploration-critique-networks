@@ -4,11 +4,6 @@ import gymnasium as gym
 import torch
 import torch.nn as nn
 
-
-
-def sample_action(action_mean, action_std):
-    return action_mean + action_std * torch.randn_like(action_mean)
-
 def evaluate(
     model_path: str,
     make_env: Callable,
@@ -20,7 +15,7 @@ def evaluate(
     capture_video: bool = True,
     exploration_noise: float = 0.1,
 ):
-    envs = gym.vector.SyncVectorEnv([make_env(env_id, 0, 0, capture_video, run_name)])
+    envs = gym.vector.SyncVectorEnv([make_env(env_id, 0, 0, capture_video, run_name,True)])
     actor = Model[0](envs).to(device)
     qf = Model[1](envs).to(device)
     actor_params, qf_params = torch.load(model_path, map_location=device)
@@ -34,8 +29,7 @@ def evaluate(
     episodic_returns = []
     while len(episodic_returns) < eval_episodes:
         with torch.no_grad():
-            mean, std = actor(torch.Tensor(obs).to(device))
-            actions = sample_action(mean, std)
+            actions = actor(torch.Tensor(obs).to(device))
             actions += torch.normal(0, actor.action_scale * exploration_noise)
             actions = (
                 actions.cpu()
@@ -45,13 +39,12 @@ def evaluate(
 
         next_obs, _, _, _, infos = envs.step(actions)
         if "final_info" in infos:
-            for info in infos["final_info"]:
-                if "episode" not in info:
-                    continue
+            for reward in infos["final_info"]["episode"]['r']:
                 print(
-                    f"eval_episode={len(episodic_returns)}, episodic_return={info['episode']['r']}"
+                    f"eval_episode={len(episodic_returns)}, episodic_return={reward}"
                 )
                 episodic_returns += [info["episode"]["r"]]
+                break            
         obs = next_obs
 
     return episodic_returns
