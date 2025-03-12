@@ -60,7 +60,7 @@ def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+            env = gym.wrappers.RecordVideo(env, f"{run_name}/videos")
             env.recorded_frames = []
         else:
             env = gym.make(env_id)
@@ -114,9 +114,13 @@ if __name__ == "__main__":
     import stable_baselines3 as sb3
 
     args = tyro.cli(Args)
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"runs/{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    os.makedirs(f"{run_name}/", exist_ok=True)
+    os.makedirs(f"{run_name}/models", exist_ok=True)
+    os.makedirs(f"{run_name}/logs", exist_ok=True)
+    os.makedirs(f"{run_name}/videos", exist_ok=True)
 
-    writer = SummaryWriter(f"runs/{run_name}")
+    writer = SummaryWriter(f"{run_name}/logs")
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s"
@@ -133,7 +137,7 @@ if __name__ == "__main__":
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed, 0, args.capture_video, run_name)]
+        [make_env(args.env_id, args.seed, 0, args.capture_video, run_name)], autoreset_mode=gym.vector.vector_env.AutoresetMode.SAME_STEP
     )
     assert isinstance(
         envs.single_action_space, gym.spaces.Box
@@ -173,18 +177,20 @@ if __name__ == "__main__":
                 actions = actions.cpu().numpy().clip(envs.single_action_space.low, envs.single_action_space.high)
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
-
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
-            for info in infos["final_info"]:
+            for reward in infos["final_info"]["episode"]['r']:
                 print(
-                    f"global_step={global_step}, episodic_return={info['episode']['r']}"
+                    f"global_step={global_step}, episodic_return={reward}"
                 )
                 writer.add_scalar(
-                    "charts/episodic_return", info["episode"]["r"], global_step
+                    "charts/episodic_return", reward, global_step
                 )
+                break
+
+            for length in infos["final_info"]["episode"]['l']:
                 writer.add_scalar(
-                    "charts/episodic_length", info["episode"]["l"], global_step
+                    "charts/episodic_length", length, global_step
                 )
                 break
 
@@ -192,7 +198,8 @@ if __name__ == "__main__":
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
             if trunc:
-                real_next_obs[idx] = infos["final_observation"][idx]
+                print(infos)
+                real_next_obs[idx] = infos["final_obs"][idx]
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
@@ -249,7 +256,7 @@ if __name__ == "__main__":
                 )
 
     if args.save_model:
-        model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
+        model_path = f"{run_name}/models/{args.exp_name}.cleanrl_model"
         torch.save((actor.state_dict(), qf1.state_dict()), model_path)
         print(f"model saved to {model_path}")
         from ddpg_eval import evaluate

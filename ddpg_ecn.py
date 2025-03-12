@@ -66,6 +66,7 @@ run_name = f"runs/{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())
 os.makedirs(run_name, exist_ok=True)
 os.makedirs(f"{run_name}/models", exist_ok=True)
 os.makedirs(f"{run_name}/logs", exist_ok=True)
+os.makedirs(f"{run_name}/videos", exist_ok=True)
 random.seed(args.seed)
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
@@ -82,7 +83,7 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
             env = gym.wrappers.RecordVideo(
-                env, f"videos/{run_name.replace('runs/', '')}"
+                env, f"{run_name}/videos"
             )
             env.recorded_frames = []
         else:
@@ -95,7 +96,8 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
 
 envs = gym.vector.SyncVectorEnv(
-    [make_env(args.env_id, args.seed, 0, args.capture_video, run_name)]
+    [make_env(args.env_id, args.seed, 0, args.capture_video, run_name)], 
+    autoreset_mode=gym.vector.vector_env.AutoresetMode.SAME_STEP
 )
 
 ExplorationBufferElement = namedtuple(
@@ -178,7 +180,7 @@ class StateAggregationEncoder(nn.Module):
         self.batch_norm_3 = nn.BatchNorm1d(self.latent_size)
 
     def forward(self, state, value):
-        x = self.fc1(torch.tensor(torch.hstack((state, value)), device=device, dtype=torch.float))
+        x = self.fc1(torch.tensor(torch.hstack((state, value)), device=device, dtype=torch.float32))
         x = self.batch_norm_1(x)
         x = F.relu(x)
 
@@ -231,7 +233,7 @@ class StateAggregationAutoencoder(nn.Module):
         self.decoder = StateAggregationDecoder(env, latent_size=latent_size)
 
     def forward(self, state, value):
-        return self.decoder(torch.tensor(self.encoder(state, value), device=device, dtype=torch.float))
+        return self.decoder(torch.tensor(self.encoder(state, value), device=device, dtype=torch.float32))
 
     def save(self):
         self.encoder.save()
@@ -285,7 +287,7 @@ class PositionalEncoding(nn.Module):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
         positional_encoding = torch.zeros(length, embedding_size)
-        position = torch.arange(0, length, dtype=torch.float).unsqueeze(1)
+        position = torch.arange(0, length, dtype=torch.float32).unsqueeze(1)
         div_term = torch.exp(
             torch.arange(0, embedding_size, 2) * (-math.log(10000.0) / embedding_size)
         )
@@ -398,40 +400,51 @@ def train_state_value_network():
     def generate_rollouts(num_episodes=NUM_EPISODES, gamma=args.gamma):
         all_states = []
         all_returns = []
-        for ep in range(num_episodes):
-            obs, _ = envs.reset(seed=args.seed + ep)
+        
+        obs, _ = envs.reset(seed=args.seed)
+        episode_states = []
+        episode_rewards = []
+        current_episode = 0
+        while current_episode < num_episodes:
             done = np.array([False] * envs.num_envs)
-            episode_states = []
-            episode_rewards = []
 
-            while (not done.all()):
-                episode_states.append(obs)
-                actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
-                next_obs, rewards, terminations, truncations, infos = envs.step(actions)
-                episode_rewards.append(rewards)
-                done = np.logical_or(terminations, truncations)
-                obs = next_obs
+            actions = np.array(
+                [envs.single_action_space.sample() for _ in range(envs.num_envs)]
+            )
+            episode_states.append(obs)
+            next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+            done = np.logical_or(terminations, truncations)          
+            episode_states.append(obs)
+            episode_rewards.append(rewards)
+            
+            real_next_obs = next_obs.copy()
+            for idx, is_done in enumerate(done):
+                if is_done:
+                    episode_states = np.array(episode_states)
+                    episode_rewards = np.array(episode_rewards)
+                    
+                    T = episode_rewards.shape[0]
+                    discounted_returns = np.empty_like(episode_rewards)
+                    discounted_returns[-1] = episode_rewards[-1]
+                    for t in range(T - 2, -1, -1):
+                        discounted_returns[t] = episode_rewards[t] + gamma * discounted_returns[t + 1]
 
-            episode_states = np.array(episode_states)
-            episode_rewards = np.array(episode_rewards)
-            T = episode_rewards.shape[0]
-
-            discounted_returns = np.empty_like(episode_rewards)
-            discounted_returns[-1] = episode_rewards[-1]
-            for t in range(T - 2, -1, -1):
-                discounted_returns[t] = episode_rewards[t] + gamma * discounted_returns[t + 1]
-
-            num_envs = envs.num_envs
-            all_states.append(episode_states.reshape(-1, *episode_states.shape[2:]))
-            all_returns.append(discounted_returns.reshape(-1))
+                    num_envs = envs.num_envs
+                    all_states.append(episode_states.reshape(-1, *episode_states.shape[2:]))
+                    all_returns.append(discounted_returns.reshape(-1))
+                    
+                    episode_states = []
+                    episode_rewards = []
+                    current_episode += 1
+                    break
 
         all_states = np.concatenate(all_states, axis=0)
         all_returns = np.concatenate(all_returns, axis=0).reshape(-1, 1)
         return all_states, all_returns
 
     states_np, returns_np = generate_rollouts()
-    states_tensor = torch.tensor(states_np, device=device, dtype=torch.float)
-    returns_tensor = torch.tensor(returns_np, device=device, dtype=torch.float)
+    states_tensor = torch.tensor(states_np, device=device, dtype=torch.float32)
+    returns_tensor = torch.tensor(returns_np, device=device, dtype=torch.float32)
 
     dataset = TensorDataset(states_tensor, returns_tensor)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
@@ -492,8 +505,8 @@ def train_actor_critic(state_aggregation_encoder, state_value_net, actor=None, q
     )
 
     obs, _ = envs.reset(seed=args.seed)
-    value = state_value_net(torch.tensor(obs, dtype=torch.float))
-    encoded_obs = state_aggregation_encoder(torch.tensor(obs, dtype=torch.float), value)
+    value = state_value_net(torch.tensor(obs, dtype=torch.float32))
+    encoded_obs = state_aggregation_encoder(torch.tensor(obs, dtype=torch.float32), value)
     for global_step in range(total_timesteps):
         if global_step < args.learning_starts:
             actions = np.array(
@@ -502,7 +515,7 @@ def train_actor_critic(state_aggregation_encoder, state_value_net, actor=None, q
         else:
             with torch.no_grad():
                 actor.eval()
-                actions = actor(torch.tensor(encoded_obs, dtype=torch.float).to(device))
+                actions = actor(torch.tensor(encoded_obs, dtype=torch.float32).to(device))
                 actor.train()
                 actions += torch.normal(0, actor.action_scale * args.exploration_noise)
                 actions = (
@@ -512,25 +525,51 @@ def train_actor_critic(state_aggregation_encoder, state_value_net, actor=None, q
                 )
 
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
-        rb.add(obs, next_obs, actions, rewards, terminations, infos)
+        # TRY NOT TO MODIFY: record rewards for plotting purposes
+        if "final_info" in infos:
+            for reward in infos["final_info"]["episode"]['r']:
+                print(
+                    f"global_step={global_step}, episodic_return={reward}"
+                )
+                writer.add_scalar(
+                    "charts/episodic_return", reward, global_step
+                )
+                break
+
+            for length in infos["final_info"]["episode"]['l']:
+                writer.add_scalar(
+                    "charts/episodic_length", length, global_step
+                )
+                break
+
+        # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
+        real_next_obs = next_obs.copy()
+        for idx, trunc in enumerate(truncations):
+            if trunc:
+                real_next_obs[idx] = infos["final_obs"][idx]
+        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
         
+        # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
+        obs = next_obs
 
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
             with torch.no_grad():
                 target_actor.eval()
                 
-                next_values = state_value_net(torch.tensor(data.next_observations, dtype=torch.float))
+                next_values = state_value_net(torch.tensor(data.next_observations, dtype=torch.float32))
                 encoded_next_obs = state_aggregation_encoder(data.next_observations, next_values)
-                next_state_actions = target_actor(encoded_next_obs)
+                next_state_actions = target_actor(torch.tensor(encoded_next_obs, dtype=torch.float32))
                 
                 target_actor.train()
-                qf1_next_target = qf1_target(data.next_observations, next_state_actions)
+                qf1_next_target = qf1_target(torch.tensor(data.next_observations, dtype=torch.float32), 
+                                             torch.tensor(next_state_actions, dtype=torch.float32))
                 next_q_value = data.rewards.flatten() + (
                     1 - data.dones.flatten()
                 ) * args.gamma * (qf1_next_target).view(-1)
 
-            qf1_a_values = qf1(data.observations, data.actions).view(-1)
+            qf1_a_values = qf1(torch.tensor(data.observations, dtype=torch.float32), 
+                               torch.tensor(data.actions, dtype=torch.float32)).view(-1)
             qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
 
             # optimize the model
@@ -543,7 +582,7 @@ def train_actor_critic(state_aggregation_encoder, state_value_net, actor=None, q
 
             if global_step % args.policy_frequency == 0:
                 
-                next_values = state_value_net(torch.tensor(data.next_observations, dtype=torch.float))
+                next_values = state_value_net(torch.tensor(data.next_observations, dtype=torch.float32))
                 encoded_next_obs = state_aggregation_encoder(data.next_observations, next_values)
 
                 actor_loss = -qf1(data.observations, actor(encoded_next_obs)).mean()
