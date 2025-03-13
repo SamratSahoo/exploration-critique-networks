@@ -59,7 +59,7 @@ class Args:
 def make_env(env_id, seed, idx, capture_video, run_name, is_eval=False):
     def thunk():
         if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array", terminate_when_unhealthy=False)
+            env = gym.make(env_id, render_mode="rgb_array")
             if is_eval:
                 env = gym.wrappers.RecordVideo(env, f"{run_name}/eval")            
             else:
@@ -87,6 +87,9 @@ class QNetwork(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+    
+    def save(self):
+        torch.save(self.state_dict(), f"{run_name}/models/critic.pt")
 
 
 class Actor(nn.Module):
@@ -247,10 +250,10 @@ if __name__ == "__main__":
 
             if global_step % 100 == 0:
                 writer.add_scalar(
-                    "losses/qf1_values", qf1_a_values.mean().item(), global_step
+                    "Loss/qf1_values", qf1_a_values.mean().item(), global_step
                 )
-                writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
-                writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
+                writer.add_scalar("Loss/critic_loss", qf1_loss.item(), global_step)
+                writer.add_scalar("Loss/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar(
                     "charts/SPS",
                     int(global_step / (time.time() - start_time)),
@@ -263,6 +266,9 @@ if __name__ == "__main__":
         print(f"model saved to {model_path}")
         from ddpg_eval import evaluate
 
+        actor.save()
+        qf1.save()
+        
         episodic_returns = evaluate(
             model_path,
             make_env,
