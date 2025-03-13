@@ -394,9 +394,10 @@ class ExplorationCritic(nn.Module):
 
 
 def train_state_value_network():
-    NUM_EPISODES = 10000
+    NUM_EPISODES = 100
     BATCH_SIZE = 128
     EPOCHS = 1000
+    NUM_ROLLOUTS = 10
 
     def generate_rollouts(num_episodes=NUM_EPISODES, gamma=args.gamma):
         all_states = []
@@ -442,30 +443,32 @@ def train_state_value_network():
         all_returns = np.concatenate(all_returns, axis=0).reshape(-1, 1)
         return all_states, all_returns
 
-    states_np, returns_np = generate_rollouts()
-    states_tensor = torch.tensor(states_np, device=device, dtype=torch.float32)
-    returns_tensor = torch.tensor(returns_np, device=device, dtype=torch.float32)
-
-    dataset = TensorDataset(states_tensor, returns_tensor)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
-                            generator=torch.Generator(device=device))
-
     state_value_net = StateValueApproximator(envs).to(device)
     optimizer = optim.Adam(state_value_net.parameters(), lr=args.learning_rate)
     loss_fn = nn.MSELoss()
 
-    for epoch in range(EPOCHS):
-        epoch_loss = 0.0
-        for batch_states, batch_returns in dataloader:
-            optimizer.zero_grad()
-            predictions = state_value_net(batch_states)
-            loss = loss_fn(predictions, batch_returns)
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item() * batch_states.size(0)
-        avg_loss = epoch_loss / len(dataset)
-        writer.add_scalar("Loss/state_value_network_loss", avg_loss, epoch)
-    
+    for rollout in range(NUM_ROLLOUTS):
+        states_np, returns_np = generate_rollouts(NUM_EPISODES)
+        states_tensor = torch.tensor(states_np, device=device, dtype=torch.float32)
+        returns_tensor = torch.tensor(returns_np, device=device, dtype=torch.float32)
+
+        dataset = TensorDataset(states_tensor, returns_tensor)
+        dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
+                                generator=torch.Generator(device=device))
+
+        for epoch in range(EPOCHS):
+            print(f"Training State Value Network - Rollout: {rollout + 1}/{NUM_ROLLOUTS}, Epoch: {epoch + 1}/{EPOCHS}")
+            epoch_loss = 0.0
+            for batch_states, batch_returns in dataloader:
+                optimizer.zero_grad()
+                predictions = state_value_net(batch_states)
+                loss = loss_fn(predictions, batch_returns)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item() * batch_states.size(0)
+            avg_loss = epoch_loss / len(dataset)
+            writer.add_scalar("Loss/state_value_network_loss", avg_loss, rollout * EPOCHS + epoch)
+        
     state_value_net.save()
     return state_value_net
 
@@ -626,7 +629,8 @@ def train_state_aggregation_module(state_value_net):
     dataset = [envs.single_observation_space.sample() for i in range(NUM_SAMPLES)]
     loss_fn = nn.MSELoss()
 
-    for i in range(EPOCHS):
+    for epoch in range(EPOCHS):
+        print(f"Training State Aggregation Module - Epoch: {epoch + 1}/{EPOCHS}")
         sample = torch.tensor(
             random.sample(dataset, BATCH_SIZE), device=device, dtype=torch.float
         )
@@ -638,9 +642,10 @@ def train_state_aggregation_module(state_value_net):
         loss.backward()
         optimizer.step()
 
-        writer.add_scalar("Loss/state_aggregation_autoencoder_loss", loss, i)
+        writer.add_scalar("Loss/state_aggregation_autoencoder_loss", loss, epoch)
     
     state_value_net.train()
+    autoencoder.save()
     return autoencoder.encoder, autoencoder.decoder, autoencoder
 
 def train_exploration_critic(actor, state_aggregation_encoder):
@@ -650,7 +655,6 @@ def train_exploration_critic(actor, state_aggregation_encoder):
 if __name__ == "__main__":
     state_value_network = train_state_value_network()
     state_aggregation_encoder, _, _ = train_state_aggregation_module(state_value_network)
-
     actor, critic = train_actor_critic(state_aggregation_encoder, state_value_network)
     
     pipeline_loops = 10
