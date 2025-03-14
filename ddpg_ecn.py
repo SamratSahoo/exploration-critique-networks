@@ -247,41 +247,24 @@ class Actor(nn.Module):
     def __init__(self, env, latent_size=64):
         super().__init__()
         self.fc1 = nn.Linear(latent_size, 256)
-        self.bn1 = nn.BatchNorm1d(256)
-
         self.fc2 = nn.Linear(256, 256)
-        self.bn2 = nn.BatchNorm1d(256)
-
-        self.fc_mu = nn.Linear(256, np.array(env.single_action_space.shape).prod())
-
+        self.fc_mu = nn.Linear(256, np.prod(env.single_action_space.shape))
+        
         self.register_buffer(
-            "action_scale",
-            torch.tensor(
-                (env.action_space.high - env.action_space.low) / 2.0, dtype=torch.float
-            ),
+            "action_scale", torch.tensor((env.action_space.high - env.action_space.low) / 2.0, dtype=torch.float32)
         )
-
         self.register_buffer(
-            "action_bias",
-            torch.tensor(
-                (env.action_space.high + env.action_space.low) / 2.0, dtype=torch.float
-            ),
+            "action_bias", torch.tensor((env.action_space.high + env.action_space.low) / 2.0, dtype=torch.float32)
         )
 
     def forward(self, x):
-        x = self.fc1(x)
-        x = self.bn1(x)
-        x = F.relu(x)
-
-        x = self.fc2(x)
-        x = self.bn2(x)
-        x = F.relu(x)
-
-        mu = self.fc_mu(x)
-        return mu
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = torch.tanh(self.fc_mu(x))
+        return x * self.action_scale + self.action_bias
 
     def save(self):
-        torch.save(self.state_dict(), f"{run_name}/models/actor.pt")
+        torch.save(self, f"{run_name}/models/actor.pt")
 
 
 class PositionalEncoding(nn.Module):
@@ -478,6 +461,7 @@ def train_state_value_network():
     return state_value_net
 
 def train_actor_critic(state_aggregation_encoder, state_value_net, actor=None, qf1=None, total_timesteps=args.total_timesteps):
+    
     if isinstance(state_value_net, str):
         model = StateValueApproximator(envs)
         model.load_state_dict(torch.load(state_value_net, weights_only=False, 
@@ -512,7 +496,6 @@ def train_actor_critic(state_aggregation_encoder, state_value_net, actor=None, q
     else:
         qf1_target = Critic(envs).to(device)
         qf1_target.load_state_dict(qf1.state_dict())
-
 
     q_optimizer = optim.Adam(list(qf1.parameters()), lr=args.learning_rate)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.learning_rate)

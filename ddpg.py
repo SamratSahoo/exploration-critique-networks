@@ -254,11 +254,6 @@ if __name__ == "__main__":
                 )
                 writer.add_scalar("Loss/critic_loss", qf1_loss.item(), global_step)
                 writer.add_scalar("Loss/actor_loss", actor_loss.item(), global_step)
-                writer.add_scalar(
-                    "charts/SPS",
-                    int(global_step / (time.time() - start_time)),
-                    global_step,
-                )
 
     if args.save_model:
         model_path = f"{run_name}/models/{args.exp_name}.cleanrl_model"
