@@ -4,6 +4,7 @@ import gymnasium as gym
 import torch
 import torch.nn as nn
 
+
 def evaluate(
     model_path: str,
     make_env: Callable,
@@ -15,7 +16,9 @@ def evaluate(
     capture_video: bool = True,
     exploration_noise: float = 0.1,
 ):
-    envs = gym.vector.SyncVectorEnv([make_env(env_id, 0, 0, capture_video, run_name,True)])
+    envs = gym.vector.SyncVectorEnv(
+        [make_env(env_id, 0, 0, capture_video, run_name, True)]
+    )
     actor = Model[0](envs).to(device)
     qf = Model[1](envs).to(device)
     actor_params, qf_params = torch.load(model_path, map_location=device)
@@ -39,12 +42,10 @@ def evaluate(
 
         next_obs, _, _, _, infos = envs.step(actions)
         if "final_info" in infos:
-            for reward in infos["final_info"]["episode"]['r']:
-                print(
-                    f"eval_episode={len(episodic_returns)}, episodic_return={reward}"
-                )
-                episodic_returns += [info["episode"]["r"]]
-                break            
+            for reward in infos["final_info"]["episode"]["r"]:
+                print(f"eval_episode={len(episodic_returns)}, episodic_return={reward}")
+                episodic_returns += reward
+                break
         obs = next_obs
 
     return episodic_returns

@@ -15,7 +15,7 @@ from stable_baselines3.common.buffers import ReplayBuffer
 from collections import deque, namedtuple
 import math
 from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader, Dataset
 import stable_baselines3 as sb3
 
 os.environ["MUJOCO_GL"] = "osmesa"
@@ -118,6 +118,34 @@ ExplorationBufferElement = namedtuple(
 )
 
 
+class RolloutDataset(Dataset):
+    def __init__(self, states_np, returns_np, next_states_np, episodic_returns):
+        """
+        Custom PTyorch dataset to store rollout data.
+
+        Args:
+        - states_np (numpy.ndarray): Current states
+        - returns_np (numpy.ndarray): Corresponding returns
+        - next_states_np (numpy.ndarray): Next states
+        - episodic_returns (numpy.ndarray): Next states
+        """
+        self.states = torch.tensor(states_np, dtype=torch.float32)
+        self.returns = torch.tensor(returns_np, dtype=torch.float32)
+        self.next_states = torch.tensor(next_states_np, dtype=torch.float32)
+        self.episodic_returns = torch.tensor(episodic_returns, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.states)
+
+    def __getitem__(self, idx):
+        return (
+            self.states[idx],
+            self.returns[idx],
+            self.next_states[idx],
+            self.episodic_returns[idx],
+        )
+
+
 class StateValueApproximator(nn.Module):
     def __init__(self, env):
         super().__init__()
@@ -192,9 +220,7 @@ class StateAggregationEncoder(nn.Module):
         self.latent_size = latent_size
 
         # Input Shape is flattened state space + State Value
-        self.fc1 = nn.Linear(
-            np.array(env.single_observation_space.shape).prod() + 1, 256
-        )
+        self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 256)
         self.batch_norm_1 = nn.BatchNorm1d(256)
         self.fc2 = nn.Linear(256, 128)
         self.batch_norm_2 = nn.BatchNorm1d(128)
@@ -204,8 +230,8 @@ class StateAggregationEncoder(nn.Module):
         self.prelu1 = nn.PReLU()
         self.prelu2 = nn.PReLU()
 
-    def forward(self, state, value):
-        x = self.fc1(torch.cat((state, value), dim=1))
+    def forward(self, state):
+        x = self.fc1(state)
         x = self.batch_norm_1(x)
         x = self.prelu1(x)
 
@@ -239,6 +265,10 @@ class StateAggregationDecoder(nn.Module):
         self.batch_norm_2 = nn.BatchNorm1d(256)
         self.fc3 = nn.Linear(256, np.array(env.single_observation_space.shape).prod())
 
+        self.transition_head = nn.Linear(
+            256, np.array(env.single_observation_space.shape).prod()
+        )
+
         self.prelu1 = nn.PReLU()
         self.prelu2 = nn.PReLU()
 
@@ -251,8 +281,9 @@ class StateAggregationDecoder(nn.Module):
         x = self.batch_norm_2(x)
         x = self.prelu2(x)
 
-        x = self.fc3(x)
-        return x
+        current_state_pred = self.fc3(x)
+        next_state_pred = self.transition_head(x)
+        return current_state_pred, next_state_pred
 
     def save(self, path=None):
         if path:
@@ -270,10 +301,53 @@ class StateAggregationAutoencoder(nn.Module):
         self.encoder = StateAggregationEncoder(env, latent_size=latent_size)
         self.decoder = StateAggregationDecoder(env, latent_size=latent_size)
 
-    def forward(self, state, value):
-        encoder_out = self.encoder(state, value)
-        decoder_out = self.decoder(encoder_out)
-        return encoder_out, decoder_out
+        self.eps = 1e-8
+        self.min_vals = {
+            "contractive": float("inf"),
+            "next_state": float("inf"),
+            "reward": float("inf"),
+        }
+        self.max_vals = {
+            "contractive": float("-inf"),
+            "next_state": float("-inf"),
+            "reward": float("-inf"),
+        }
+
+    def forward(self, state):
+        encoder_out = self.encoder(state)
+        current_state_pred, next_state_pred = self.decoder(encoder_out)
+        return encoder_out, current_state_pred, next_state_pred
+
+    def update_min_max(self, loss_dict):
+        """Update running min/max values for normalization."""
+        for key, val in loss_dict.items():
+            self.min_vals[key] = min(self.min_vals[key], val.item())
+            self.max_vals[key] = max(self.max_vals[key], val.item())
+
+    def normalize_loss(self, loss, key):
+        """Normalize loss using running min-max values."""
+        min_val = self.min_vals[key]
+        max_val = self.max_vals[key]
+        return (loss - min_val) / (max_val - min_val + self.eps)
+
+    def compute_loss(
+        self,
+        encoder_out,
+        next_state_pred,
+        next_states,
+        current_state_pred,
+        current_state,
+        epsiodic_return,
+        autoencoder_regularization_coefficient,
+    ):
+        loss_contractive = contractive_loss(
+            encoder_out,
+            current_state_pred,
+            current_state,
+            autoencoder_regularization_coefficient,
+        )
+        loss_next_state = F.mse_loss(next_state_pred, next_states)
+        return (loss_contractive + loss_next_state) - epsiodic_return.mean()
 
     def save(self, path=None):
         self.encoder.save()
@@ -510,7 +584,7 @@ class ECNTrainer:
         self.autoencoder_validation_frequency = 10
 
         # Autoencoder Single Step Training Hyperparameters
-        self.autoencoder_num_updates = 10
+        self.autoencoder_num_updates = 1
 
         # State value function single step training hyperparameters
         self.state_value_net_num_updates = 10
@@ -543,73 +617,91 @@ class ECNTrainer:
         self.state_value_net_loss_counter = 0
         self.state_aggregation_autoencoder_loss_counter = 0
 
+    def generate_rollouts(self, num_episodes=10):
+        all_states = []
+        all_returns = []
+        all_next_states = []
+        all_episodic_returns = []
+
+        obs, _ = self.env.reset(seed=self.seed)
+        episode_states = []
+        episode_rewards = []
+        episode_next_states = []
+        current_episode = 0
+        current_step = 0
+        while current_episode < num_episodes:
+            if self.print_logs:
+                print(
+                    f"Generating Rollout: Episode: {current_episode + 1}/{num_episodes}, Step: {current_step+1}/{envs.envs[0].spec.max_episode_steps}"
+                )
+            done = np.array([False] * self.env.num_envs)
+
+            actions = np.array(
+                [
+                    self.env.single_action_space.sample()
+                    for _ in range(self.env.num_envs)
+                ]
+            )
+            next_obs, rewards, terminations, truncations, infos = self.env.step(actions)
+            done = np.logical_or(terminations, truncations)
+            episode_states.append(obs)
+            episode_rewards.append(rewards)
+            episode_next_states.append(next_obs)
+
+            obs = next_obs
+            current_step += 1
+            for _, is_done in enumerate(done):
+                if is_done:
+                    episode_states = np.array(episode_states)
+                    episode_rewards = np.array(episode_rewards)
+                    episode_next_states = np.array(episode_next_states)
+
+                    T = episode_rewards.shape[0]
+                    discounted_returns = np.empty_like(episode_rewards)
+                    discounted_returns[-1] = episode_rewards[-1]
+                    for t in range(T - 2, -1, -1):
+                        discounted_returns[t] = (
+                            episode_rewards[t] + self.gamma * discounted_returns[t + 1]
+                        )
+
+                    all_states.append(
+                        episode_states.reshape(-1, *episode_states.shape[2:])
+                    )
+                    all_next_states.append(
+                        episode_next_states.reshape(-1, *episode_next_states.shape[2:])
+                    )
+                    all_returns.append(discounted_returns.reshape(-1))
+                    all_episodic_returns.append(
+                        np.array(
+                            [infos["final_info"]["episode"]["r"][-1]]
+                            * np.array(discounted_returns.shape).prod()
+                        )
+                    )
+
+                    episode_states = []
+                    episode_rewards = []
+                    episode_next_states = []
+                    current_episode += 1
+                    current_step = 0
+                    break
+
+        all_states = np.concatenate(all_states, axis=0)
+        all_next_states = np.concatenate(all_next_states, axis=0)
+        all_returns = np.concatenate(all_returns, axis=0)
+        all_episodic_returns = np.concatenate(all_episodic_returns, axis=0)
+        return all_states, all_returns, all_next_states, all_episodic_returns
+
     def train_baseline_state_value_network(self):
         self.state_value_net.train()
-
-        def generate_rollouts():
-            all_states = []
-            all_returns = []
-
-            obs, _ = self.env.reset(seed=self.seed)
-            episode_states = []
-            episode_rewards = []
-            current_episode = 0
-            current_step = 0
-            while current_episode < self.state_value_net_baseline_rollout_episodes:
-                if self.print_logs:
-                    print(
-                        f"Generating Rollout: Episode: {current_episode + 1}/{self.state_value_net_baseline_rollout_episodes}, Step: {current_step+1}/{envs.envs[0].spec.max_episode_steps}"
-                    )
-                done = np.array([False] * self.env.num_envs)
-
-                actions = np.array(
-                    [
-                        self.env.single_action_space.sample()
-                        for _ in range(self.env.num_envs)
-                    ]
-                )
-                next_obs, rewards, terminations, truncations, _ = self.env.step(actions)
-                done = np.logical_or(terminations, truncations)
-                episode_states.append(obs)
-                episode_rewards.append(rewards)
-
-                obs = next_obs
-                current_step += 1
-                for _, is_done in enumerate(done):
-                    if is_done:
-                        episode_states = np.array(episode_states)
-                        episode_rewards = np.array(episode_rewards)
-
-                        T = episode_rewards.shape[0]
-                        discounted_returns = np.empty_like(episode_rewards)
-                        discounted_returns[-1] = episode_rewards[-1]
-                        for t in range(T - 2, -1, -1):
-                            discounted_returns[t] = (
-                                episode_rewards[t]
-                                + self.gamma * discounted_returns[t + 1]
-                            )
-
-                        all_states.append(
-                            episode_states.reshape(-1, *episode_states.shape[2:])
-                        )
-                        all_returns.append(discounted_returns.reshape(-1))
-
-                        episode_states = []
-                        episode_rewards = []
-                        current_episode += 1
-                        current_step = 0
-                        break
-
-            all_states = np.concatenate(all_states, axis=0)
-            all_returns = np.concatenate(all_returns, axis=0).reshape(-1, 1)
-            return all_states, all_returns
 
         optimizer = optim.Adam(
             self.state_value_net.parameters(), lr=self.state_value_net_learning_rate
         )
         loss_fn = nn.MSELoss()
-        for rollout in range(self.state_value_net_baseline_num_rollout):
-            states_np, returns_np = generate_rollouts()
+        for rollout in range(self.state_value_net_baseline_rollout_episodes):
+            states_np, returns_np, _, _ = self.generate_rollouts(
+                self.state_value_net_baseline_num_rollout
+            )
             states_tensor = torch.tensor(states_np, device=device, dtype=torch.float32)
             returns_tensor = torch.tensor(
                 returns_np, device=device, dtype=torch.float32
@@ -642,7 +734,7 @@ class ECNTrainer:
                     avg_loss,
                     self.state_value_net_loss_counter,
                 )
-                self.self.state_value_net_loss_counter += 1
+                self.state_value_net_loss_counter += 1
 
         self.state_value_net.save()
         self.state_value_net.eval()
@@ -652,17 +744,12 @@ class ECNTrainer:
         optimizer = optim.Adam(
             self.autoencoder.parameters(), lr=self.autoencoder_learning_rate
         )
-
-        dataset = torch.tensor(
-            [
-                envs.single_observation_space.sample()
-                for _ in range(self.autoencoder_num_samples)
-            ],
-            dtype=torch.float32,
-            device=device,
+        states_np, returns_np, next_states_np, episodic_returns = (
+            self.generate_rollouts(self.state_value_net_baseline_num_rollout)
         )
-
-        # Split dataset into train, validation, and test sets
+        dataset = RolloutDataset(
+            states_np, returns_np, next_states_np, episodic_returns
+        )
         train_size = int(0.8 * len(dataset))
         val_size = int(0.1 * len(dataset))
         test_size = len(dataset) - train_size - val_size
@@ -671,7 +758,6 @@ class ECNTrainer:
             [train_size, val_size, test_size],
             generator=torch.Generator(device=device),
         )
-
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.autoencoder_batch_size,
@@ -698,17 +784,22 @@ class ECNTrainer:
                 )
 
             for batch in train_loader:
-                batch = batch.to(device)
-                batch.requires_grad = True
-                value = self.state_value_net(batch)
-                encoder_out, decoder_out = self.autoencoder(batch, value)
-                loss = contractive_loss(
+                current_state, _, next_states, episodic_return = batch
+                current_state = current_state.to(device)
+                current_state.requires_grad = True
+
+                encoder_out, current_state_pred, next_state_pred = self.autoencoder(
+                    current_state
+                )
+                loss = self.autoencoder.compute_loss(
                     encoder_out,
-                    decoder_out,
-                    batch,
+                    next_state_pred,
+                    next_states,
+                    current_state_pred,
+                    current_state,
+                    episodic_return,
                     self.autoencoder_regularization_coefficient,
                 )
-
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -724,16 +815,23 @@ class ECNTrainer:
                 self.autoencoder.eval()
                 val_loss = 0.0
                 for batch in val_loader:
-                    batch = batch.to(device)
-                    batch.requires_grad = True
-                    value = self.state_value_net(batch)
-                    encoder_out, decoder_out = self.autoencoder(batch, value)
-                    val_loss += contractive_loss(
+                    current_state, _, next_states, episodic_return = batch
+                    current_state = current_state.to(device)
+                    current_state.requires_grad = True
+                    encoder_out, current_state_pred, next_state_pred = self.autoencoder(
+                        current_state
+                    )
+                    loss = self.autoencoder.compute_loss(
                         encoder_out,
-                        decoder_out,
-                        batch,
+                        next_state_pred,
+                        next_states,
+                        current_state_pred,
+                        current_state,
+                        episodic_return,
                         self.autoencoder_regularization_coefficient,
-                    ).item()
+                    )
+                    val_loss += loss.item()
+
                 val_loss /= len(val_loader)
                 writer.add_scalar("Loss/validation_autoencoder_loss", val_loss, epoch)
                 self.autoencoder.train()
@@ -742,16 +840,22 @@ class ECNTrainer:
         self.autoencoder.eval()
         test_loss = 0.0
         for batch in test_loader:
-            batch = batch.to(device)
-            batch.requires_grad = True
-            value = self.state_value_net(batch)
-            encoder_out, decoder_out = self.autoencoder(batch, value)
-            test_loss += contractive_loss(
+            current_state, _, next_states, episodic_return = batch
+            current_state = current_state.to(device)
+            current_state.requires_grad = True
+            encoder_out, current_state_pred, next_state_pred = self.autoencoder(
+                current_state
+            )
+            loss = self.autoencoder.compute_loss(
                 encoder_out,
-                decoder_out,
-                batch,
+                next_state_pred,
+                next_states,
+                current_state_pred,
+                current_state,
+                episodic_return,
                 self.autoencoder_regularization_coefficient,
-            ).item()
+            )
+            test_loss += loss.item()
         test_loss /= len(test_loader)
 
         if self.print_logs:
@@ -761,22 +865,32 @@ class ECNTrainer:
         self.autoencoder.save()
         self.autoencoder.eval()
 
-    def train_single_step_state_aggregation_module(self, observations):
+    def train_single_step_state_aggregation_module(
+        self, observations, next_observations, episodic_return
+    ):
+        next_states = torch.tensor(
+            next_observations, requires_grad=True, dtype=torch.float32
+        )
         self.autoencoder.train()
         optimizer = torch.optim.Adam(
             lr=self.autoencoder_learning_rate, params=self.autoencoder.parameters()
         )
 
-        observations = torch.tensor(
+        current_state = torch.tensor(
             observations, requires_grad=True, dtype=torch.float32
         )
+
         for i in range(self.autoencoder_num_updates):
-            value = self.state_value_net(observations)
-            encoder_out, decoder_out = self.autoencoder(observations, value)
-            loss = contractive_loss(
+            encoder_out, current_state_pred, next_state_pred = self.autoencoder(
+                current_state
+            )
+            loss = self.autoencoder.compute_loss(
                 encoder_out,
-                decoder_out,
-                observations,
+                next_state_pred,
+                next_states,
+                current_state_pred,
+                current_state,
+                episodic_return,
                 self.autoencoder_regularization_coefficient,
             )
 
@@ -851,14 +965,11 @@ class ECNTrainer:
         )
 
         obs, _ = self.env.reset(seed=self.seed)
-        value = self.state_value_net(torch.tensor(obs, dtype=torch.float32))
-        encoded_obs = self.autoencoder.encoder(
-            torch.tensor(obs, dtype=torch.float32), value
-        )
+        encoded_obs = self.autoencoder.encoder(torch.tensor(obs, dtype=torch.float32))
         current_episode_states = []
         current_episode_rewards = []
+        current_episode_next_states = []
         for global_step in range(self.actor_critic_timesteps):
-            current_episode_states.append(obs.squeeze(0))
             if global_step < self.learning_starts:
                 actions = np.array(
                     [envs.single_action_space.sample() for _ in range(envs.num_envs)]
@@ -882,11 +993,14 @@ class ECNTrainer:
                     )
 
             next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+            current_episode_states.append(obs.squeeze(0))
             current_episode_rewards.append(rewards.squeeze(0))
+            current_episode_next_states.append(next_obs.squeeze(0))
             # TRY NOT TO MODIFY: record rewards for plotting purposes
             if "final_info" in infos:
                 for reward in infos["final_info"]["episode"]["r"]:
-                    print(f"global_step={global_step}, episodic_return={reward}")
+                    if self.print_logs:
+                        print(f"global_step={global_step}, episodic_return={reward}")
                     writer.add_scalar("charts/episodic_return", reward, global_step)
                     break
 
@@ -900,13 +1014,16 @@ class ECNTrainer:
                 if trunc:
                     real_next_obs[idx] = infos["final_obs"][idx]
                     self.train_single_step_state_aggregation_module(
-                        current_episode_states
+                        current_episode_states,
+                        current_episode_next_states,
+                        infos["final_info"]["episode"]["r"],
                     )
-                    self.train_single_step_state_value_network(
-                        current_episode_states, current_episode_rewards
-                    )
+                    # self.train_single_step_state_value_network(
+                    #     current_episode_states, current_episode_rewards
+                    # )
                     current_episode_states = []
                     current_episode_rewards = []
+                    current_episode_next_states = []
 
             self.replay_buffer.add(
                 obs, real_next_obs, actions, rewards, terminations, infos
@@ -919,13 +1036,8 @@ class ECNTrainer:
                 data = self.replay_buffer.sample(self.actor_critic_batch_size)
                 with torch.no_grad():
                     self.actor_target.eval()
-
-                    next_values = self.state_value_net(
-                        torch.tensor(data.next_observations, dtype=torch.float32)
-                    )
                     encoded_next_obs = self.autoencoder.encoder(
-                        torch.tensor(data.next_observations, dtype=torch.float32),
-                        next_values,
+                        torch.tensor(data.next_observations, dtype=torch.float32)
                     )
                     next_state_actions = self.actor_target(
                         torch.tensor(encoded_next_obs, dtype=torch.float32)
@@ -956,13 +1068,8 @@ class ECNTrainer:
                 writer.add_scalar("Loss/qf1_values", qf1_a_values.mean(), global_step)
 
                 if global_step % self.policy_update_frequency == 0:
-
-                    next_values = self.state_value_net(
-                        torch.tensor(data.next_observations, dtype=torch.float32)
-                    )
                     encoded_next_obs = self.autoencoder.encoder(
-                        torch.tensor(data.next_observations, dtype=torch.float32),
-                        next_values,
+                        torch.tensor(data.next_observations, dtype=torch.float32)
                     )
 
                     actor_loss = -self.critic(
@@ -1005,7 +1112,8 @@ class ECNTrainer:
 if __name__ == "__main__":
     ecn_trainer = ECNTrainer(
         envs,
-        state_value_net="./training_checkpoints/state_value_approximator.pt",
-        autoencoder="./training_checkpoints/state_aggregation_autoencoder.pt",
+        # state_value_net="./training_checkpoints/state_value_approximator.pt",
     )
+    # ecn_trainer.train_baseline_state_value_network()
+    ecn_trainer.train_baseline_state_aggregation_module()
     ecn_trainer.train()
