@@ -34,7 +34,7 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "Hopper-v5"
     """the environment id of the Atari game"""
-    total_timesteps: int = 1000000
+    total_timesteps: int = 2000000
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""

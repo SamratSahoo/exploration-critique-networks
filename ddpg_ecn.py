@@ -39,7 +39,7 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "Hopper-v5"
     """the environment id of the Atari game"""
-    total_timesteps: int = 1000000
+    total_timesteps: int = 2000000
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
@@ -180,29 +180,22 @@ class StateValueApproximator(nn.Module):
 
 
 class Critic(nn.Module):
-    def __init__(self, env):
+    def __init__(self, env, latent_size=64):
         super().__init__()
         self.fc1 = nn.Linear(
-            np.array(env.single_observation_space.shape).prod()
+            np.prod(env.single_observation_space.shape)
             + np.prod(env.single_action_space.shape),
             256,
         )
         self.fc2 = nn.Linear(256, 256)
         self.fc3 = nn.Linear(256, 1)
 
-        self.bn1 = nn.BatchNorm1d(256)
-        self.bn2 = nn.BatchNorm1d(256)
-
-        self.obs_space_size = np.array(env.single_observation_space.shape).prod()
-
     def forward(self, x, a):
         x = torch.cat([x, a], 1)
         x = self.fc1(x)
-        # x = self.bn1(x)
         x = F.relu(x)
 
         x = self.fc2(x)
-        # x = self.bn2(x)
         x = F.relu(x)
         x = self.fc3(x)
         return x
@@ -528,6 +521,7 @@ class ECNTrainer:
         actor_critic_batch_size=args.batch_size,
     ):
         self.env = env
+        self.env.single_observation_space.dtype = np.float32
         self.seed = seed
         self.state_value_net = StateValueApproximator(env).to(device)
         self.print_logs = print_logs
@@ -538,11 +532,14 @@ class ECNTrainer:
             env, latent_size=self.latent_size
         )
 
-        self.actor = Actor(env, latent_size=self.latent_size)
-        self.critic = Critic(env)
-        self.actor_target = Actor(env, latent_size=self.latent_size)
-        self.critic_target = Critic(env)
+        self.actor = Actor(env, latent_size=self.latent_size).to(device)
+        self.critic = Critic(env, latent_size=self.latent_size).to(device)
+        self.actor_target = Actor(env, latent_size=self.latent_size).to(device)
+        self.critic_target = Critic(env, latent_size=self.latent_size).to(device)
 
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        
         self.exploration_critic = ExplorationCritic(
             env, latent_state_size=self.latent_size
         )
@@ -577,7 +574,7 @@ class ECNTrainer:
 
         # Autoencoder training hyperparameters
         self.autoencoder_batch_size = 128
-        self.autoencoder_learning_rate = 1e-3
+        self.autoencoder_learning_rate = 1e-4
         self.autoencoder_epochs = 200
         self.autoencoder_num_samples = 10000
         self.autoencoder_regularization_coefficient = 1e-4
@@ -616,6 +613,7 @@ class ECNTrainer:
         # Counters for logging
         self.state_value_net_loss_counter = 0
         self.state_aggregation_autoencoder_loss_counter = 0
+        
 
     def generate_rollouts(self, num_episodes=10):
         all_states = []
@@ -965,22 +963,20 @@ class ECNTrainer:
         )
 
         obs, _ = self.env.reset(seed=self.seed)
-        encoded_obs = self.autoencoder.encoder(torch.tensor(obs, dtype=torch.float32))
         current_episode_states = []
         current_episode_rewards = []
         current_episode_next_states = []
         for global_step in range(self.actor_critic_timesteps):
+            encoded_obs = self.autoencoder.encoder(torch.tensor(obs, dtype=torch.float32).to(device))
             if global_step < self.learning_starts:
                 actions = np.array(
                     [envs.single_action_space.sample() for _ in range(envs.num_envs)]
                 )
             else:
                 with torch.no_grad():
-                    self.actor.eval()
                     actions = self.actor(
-                        torch.tensor(encoded_obs, dtype=torch.float32).to(device)
+                        encoded_obs
                     )
-                    self.actor.train()
                     actions += torch.normal(
                         0, self.actor.action_scale * self.exploration_noise
                     )
@@ -988,11 +984,13 @@ class ECNTrainer:
                         actions.cpu()
                         .numpy()
                         .clip(
-                            envs.single_action_space.low, envs.single_action_space.high
+                            self.env.single_action_space.low, self.env.single_action_space.high
                         )
                     )
 
-            next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+            next_obs, rewards, terminations, truncations, infos = self.env.step(actions)
+            
+            encoded_next_obs = self.autoencoder.encoder(torch.tensor(next_obs, dtype=torch.float32))
             current_episode_states.append(obs.squeeze(0))
             current_episode_rewards.append(rewards.squeeze(0))
             current_episode_next_states.append(next_obs.squeeze(0))
@@ -1010,17 +1008,12 @@ class ECNTrainer:
 
             # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
             real_next_obs = next_obs.copy()
-            for idx, trunc in enumerate(np.logical_or(terminations, truncations)):
-                if trunc:
+            for idx, is_done in enumerate(np.logical_or(terminations, truncations)):
+                if is_done:
                     real_next_obs[idx] = infos["final_obs"][idx]
                     self.train_single_step_state_aggregation_module(
-                        current_episode_states,
-                        current_episode_next_states,
-                        infos["final_info"]["episode"]["r"],
+                        current_episode_states, current_episode_next_states, infos["final_info"]["episode"]["r"][-1]
                     )
-                    # self.train_single_step_state_value_network(
-                    #     current_episode_states, current_episode_rewards
-                    # )
                     current_episode_states = []
                     current_episode_rewards = []
                     current_episode_next_states = []
@@ -1034,27 +1027,17 @@ class ECNTrainer:
 
             if global_step > self.learning_starts:
                 data = self.replay_buffer.sample(self.actor_critic_batch_size)
+                encoded_data_obs = self.autoencoder.encoder(data.observations)
+                encoded_data_next_obs = self.autoencoder.encoder(data.next_observations)
+                
                 with torch.no_grad():
-                    self.actor_target.eval()
-                    encoded_next_obs = self.autoencoder.encoder(
-                        torch.tensor(data.next_observations, dtype=torch.float32)
-                    )
-                    next_state_actions = self.actor_target(
-                        torch.tensor(encoded_next_obs, dtype=torch.float32)
-                    )
-
-                    self.actor_target.train()
-                    qf1_next_target = self.critic_target(
-                        torch.tensor(data.next_observations, dtype=torch.float32),
-                        torch.tensor(next_state_actions, dtype=torch.float32),
-                    )
-                    next_q_value = data.rewards.flatten() + (
-                        1 - data.dones.flatten()
-                    ) * self.gamma * (qf1_next_target).view(-1)
-
+                    next_state_actions = self.actor_target(encoded_data_next_obs)
+                    qf1_next_target = self.critic_target(data.next_observations, next_state_actions)
+                    next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (qf1_next_target).view(-1)
+                
                 qf1_a_values = self.critic(
-                    torch.tensor(data.observations, dtype=torch.float32),
-                    torch.tensor(data.actions, dtype=torch.float32),
+                    data.observations,
+                    data.actions,
                 ).view(-1)
 
                 qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
@@ -1064,17 +1047,10 @@ class ECNTrainer:
                 qf1_loss.backward()
                 critic_optimizer.step()
 
-                writer.add_scalar("Loss/critic_loss", qf1_loss, global_step)
-                writer.add_scalar("Loss/qf1_values", qf1_a_values.mean(), global_step)
-
                 if global_step % self.policy_update_frequency == 0:
-                    encoded_next_obs = self.autoencoder.encoder(
-                        torch.tensor(data.next_observations, dtype=torch.float32)
-                    )
-
+                    actor_action = self.actor(encoded_data_obs)                    
                     actor_loss = -self.critic(
-                        torch.tensor(data.observations, dtype=torch.float32),
-                        torch.tensor(self.actor(encoded_next_obs), dtype=torch.float32),
+                        data.observations, actor_action,
                     ).mean()
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
@@ -1083,8 +1059,6 @@ class ECNTrainer:
                         print(
                             f"Training Actor Critic: Current timestep: {global_step}/{self.actor_critic_timesteps}, Actor Loss: {actor_loss}, Critic Loss: {qf1_loss}"
                         )
-
-                    writer.add_scalar("Loss/actor_loss", actor_loss, global_step)
 
                     # update the target network
                     for param, target_param in zip(
@@ -1101,6 +1075,14 @@ class ECNTrainer:
                             self.polyak_constant * param.data
                             + (1 - self.polyak_constant) * target_param.data
                         )
+                
+                if global_step % 100 == 0:
+                    writer.add_scalar(
+                        "Loss/qf1_values", qf1_a_values.mean().item(), global_step
+                    )
+                    writer.add_scalar("Loss/critic_loss", qf1_loss.item(), global_step)
+                    writer.add_scalar("Loss/actor_loss", actor_loss.item(), global_step)
+
 
         self.env.close()
         self.actor.save()
@@ -1112,8 +1094,9 @@ class ECNTrainer:
 if __name__ == "__main__":
     ecn_trainer = ECNTrainer(
         envs,
+        print_logs=False
         # state_value_net="./training_checkpoints/state_value_approximator.pt",
     )
     # ecn_trainer.train_baseline_state_value_network()
-    ecn_trainer.train_baseline_state_aggregation_module()
+    # ecn_trainer.train_baseline_state_aggregation_module()
     ecn_trainer.train()
