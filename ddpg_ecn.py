@@ -97,17 +97,6 @@ def make_env(env_id, seed, idx, capture_video, run_name, is_eval=False):
     return thunk
 
 
-def contractive_loss(encoder_out, decoder_out, data, lmbda):
-    criterion = nn.MSELoss()
-    mse_loss = criterion(decoder_out, data)
-
-    encoder_out.backward(torch.ones(encoder_out.size()), retain_graph=True)
-    loss2 = torch.sqrt(torch.sum(torch.pow(data.grad, 2)))
-    data.grad.data.zero_()
-    loss = mse_loss + (lmbda * loss2)
-    return loss
-
-
 envs = gym.vector.SyncVectorEnv(
     [make_env(args.env_id, args.seed, 0, args.capture_video, run_name)],
     autoreset_mode=gym.vector.vector_env.AutoresetMode.SAME_STEP,
@@ -288,40 +277,26 @@ class StateAggregationDecoder(nn.Module):
 
 
 class StateAggregationAutoencoder(nn.Module):
-    def __init__(self, env: gym.Env, latent_size=64):
+    def __init__(self, env: gym.Env, latent_size=64, alpha=0.99):
         super(StateAggregationAutoencoder, self).__init__()
 
         self.encoder = StateAggregationEncoder(env, latent_size=latent_size)
         self.decoder = StateAggregationDecoder(env, latent_size=latent_size)
-
-        self.eps = 1e-8
-        self.min_vals = {
-            "contractive": float("inf"),
-            "next_state": float("inf"),
-            "reward": float("inf"),
-        }
-        self.max_vals = {
-            "contractive": float("-inf"),
-            "next_state": float("-inf"),
-            "reward": float("-inf"),
-        }
-
+        
+        # Running averages for loss scaling
+        self.register_buffer("running_avg_loss_current", torch.tensor(1.0))
+        self.register_buffer("running_avg_loss_next", torch.tensor(1.0))
+        self.register_buffer("running_avg_return", torch.tensor(1.0))
+        
+        self.alpha = alpha  # Smoothing factor for EMA
+    
     def forward(self, state):
         encoder_out = self.encoder(state)
         current_state_pred, next_state_pred = self.decoder(encoder_out)
         return encoder_out, current_state_pred, next_state_pred
 
-    def update_min_max(self, loss_dict):
-        """Update running min/max values for normalization."""
-        for key, val in loss_dict.items():
-            self.min_vals[key] = min(self.min_vals[key], val.item())
-            self.max_vals[key] = max(self.max_vals[key], val.item())
-
-    def normalize_loss(self, loss, key):
-        """Normalize loss using running min-max values."""
-        min_val = self.min_vals[key]
-        max_val = self.max_vals[key]
-        return (loss - min_val) / (max_val - min_val + self.eps)
+    def update_running_average(self, current, new_value):
+        return self.alpha * current + (1 - self.alpha) * new_value
 
     def compute_loss(
         self,
@@ -330,17 +305,28 @@ class StateAggregationAutoencoder(nn.Module):
         next_states,
         current_state_pred,
         current_state,
-        epsiodic_return,
+        episodic_return,
         autoencoder_regularization_coefficient,
     ):
-        loss_contractive = contractive_loss(
-            encoder_out,
-            current_state_pred,
-            current_state,
-            autoencoder_regularization_coefficient,
-        )
+        loss_current_state = F.mse_loss(current_state_pred, current_state)
         loss_next_state = F.mse_loss(next_state_pred, next_states)
-        return (loss_contractive + loss_next_state) - epsiodic_return.mean()
+        episodic_return_mean = torch.tensor(episodic_return.mean(), device=loss_current_state.device)
+        with torch.no_grad():
+            self.running_avg_loss_current = self.update_running_average(
+                self.running_avg_loss_current, loss_current_state.detach()
+            )
+            self.running_avg_loss_next = self.update_running_average(
+                self.running_avg_loss_next, loss_next_state.detach()
+            )
+            self.running_avg_return = self.update_running_average(
+                self.running_avg_return, episodic_return_mean.detach()
+            )
+        
+        # Scale losses by running averages
+        scaled_loss_current = loss_current_state / (self.running_avg_loss_current + 1e-8)
+        scaled_loss_next = loss_next_state / (self.running_avg_loss_next + 1e-8)
+        scaled_return = episodic_return.mean() / (self.running_avg_return + 1e-8)
+        return (scaled_loss_current + scaled_loss_next) - scaled_return
 
     def save(self, path=None):
         self.encoder.save()
@@ -421,6 +407,9 @@ class ExplorationBuffer:
         self.buffer.append(
             ExplorationBufferElement(latent_state, action, latent_next_state)
         )
+        
+    def get_last_k_elements(self, k):
+        return self.buffer[max(len(self.buffer) - k, 0):]
 
 
 class ExplorationCritic(nn.Module):
@@ -449,7 +438,7 @@ class ExplorationCritic(nn.Module):
         )
         # Embedding for exploration buffer tokens
         self.exploration_embedding = nn.Linear(
-            latent_state_size + np.array(env.single_action_space.shape).prod(),
+            2*latent_state_size + np.array(env.single_action_space.shape).prod(),
             transformer_embedding_size,
         )
 
@@ -477,6 +466,9 @@ class ExplorationCritic(nn.Module):
             nn.Linear(transformer_embedding_size // 2, 1),
         )
 
+    def compute_loss(self):
+        pass
+    
     def forward(self, latent_state, latent_next_state, action, exploration_buffer_seq):
         # Embed latent state, action, latent next state,
         current_state_token = self.state_embedding(latent_state)
@@ -496,9 +488,11 @@ class ExplorationCritic(nn.Module):
         exploration_score = self.fc_out(aggregate_cross).squeeze(-1)
         return exploration_score
 
-    def save(self):
-        torch.save(self.state_dict(), f"{run_name}/models/exploration_critic.pt")
-
+    def save(self, path=None):
+        if not path:
+            torch.save(self.state_dict(), f"{run_name}/models/exploration_critic.pt")
+        else:
+            torch.save(self.state_dict(), path)
 
 class ECNTrainer:
     def __init__(
@@ -613,6 +607,10 @@ class ECNTrainer:
         # Counters for logging
         self.state_value_net_loss_counter = 0
         self.state_aggregation_autoencoder_loss_counter = 0
+        
+        # Exploration critic hyperparameters
+        self.exploration_buffer_num_experiences = 50
+        self.exploration_critic_learning_rate = 1e-3
         
 
     def generate_rollouts(self, num_episodes=10):
@@ -893,7 +891,7 @@ class ECNTrainer:
             )
 
             optimizer.zero_grad()
-            loss.backward()
+            loss.backward(retain_graph=True)
             optimizer.step()
 
             writer.add_scalar(
@@ -943,9 +941,25 @@ class ECNTrainer:
 
         self.state_value_net.eval()
 
-    def train_single_step_exploration_critic(self):
-        pass
-
+    def train_single_step_exploration_critic(self, latent_state, action, latent_next_state):
+        optimizer = optim.Adam(
+            list(self.exploration_critic.parameters()), lr=self.critic_learning_rate
+        )
+        recent_experiences = self.exploration_buffer.get_last_k_elements(self.exploration_buffer_num_experiences)
+        if len(recent_experiences) < self.exploration_buffer_num_experiences:
+            if self.print_logs:
+                print(f"Training Exploration Critic: Insufficient experience: Current - {len(recent_experiences)}, Need - {self.exploration_buffer_num_experiences}")
+            return
+        
+        buffer_seq_list = []
+        for exp in recent_experiences:
+            concatenated = torch.cat([exp.latent_state, exp.action, exp.latent_next_state], dim=-1)
+            buffer_seq_list.append(concatenated)
+        
+        exploration_buffer_seq = torch.stack(buffer_seq_list)
+        
+        exploration_score = self.exploration_critic(latent_state, action, latent_next_state, exploration_buffer_seq)
+        
     def train(self):
         self.state_value_net.eval()
         self.autoencoder.eval()
@@ -991,6 +1005,7 @@ class ECNTrainer:
             next_obs, rewards, terminations, truncations, infos = self.env.step(actions)
             
             encoded_next_obs = self.autoencoder.encoder(torch.tensor(next_obs, dtype=torch.float32))
+            self.exploration_buffer.add(encoded_obs, actions.squeeze(0), encoded_next_obs)
             current_episode_states.append(obs.squeeze(0))
             current_episode_rewards.append(rewards.squeeze(0))
             current_episode_next_states.append(next_obs.squeeze(0))
