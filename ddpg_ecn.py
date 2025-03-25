@@ -17,8 +17,9 @@ import math
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import TensorDataset, DataLoader, Dataset
 import stable_baselines3 as sb3
+from sys import platform
 
-os.environ["MUJOCO_GL"] = "osmesa"
+os.environ["MUJOCO_GL"] = "glfw" if platform == "darwin" else "osmesa"
 
 
 @dataclass
