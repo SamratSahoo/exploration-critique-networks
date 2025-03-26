@@ -469,9 +469,6 @@ class ExplorationCritic(nn.Module):
             nn.ReLU(),
             nn.Linear(transformer_embedding_size // 2, 1),
         )
-
-    def compute_loss(self):
-        pass
     
     def forward(self, latent_state, action, latent_next_state, exploration_buffer_seq):
         # Embed latent state, action, latent next state,
@@ -961,7 +958,12 @@ class ECNTrainer:
         
         exploration_buffer_seq = torch.stack(buffer_seq_list)
         exploration_score = self.exploration_critic(latent_state, action, latent_next_state, exploration_buffer_seq)
-        
+        distance = torch.linalg.norm(latent_next_state - latent_state)
+        loss = F.mse_loss(exploration_score, distance)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
         
     def train(self):
         self.state_value_net.eval()
@@ -1042,7 +1044,7 @@ class ECNTrainer:
 
             # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
             obs = next_obs
-
+            self.train_single_step_exploration_critic(encoded_obs, actions.squeeze(0), encoded_next_obs)
             if global_step > self.learning_starts:
                 data = self.replay_buffer.sample(self.actor_critic_batch_size)
                 encoded_data_obs = self.autoencoder.encoder(data.observations)
