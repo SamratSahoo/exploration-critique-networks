@@ -250,6 +250,10 @@ class StateAggregationDecoder(nn.Module):
         self.transition_head = nn.Linear(
             256, np.array(env.single_observation_space.shape).prod()
         )
+        
+        self.episodic_return_head = nn.Linear(
+            256, np.array(env.single_observation_space.shape).prod()
+        )
 
         self.prelu1 = nn.PReLU()
         self.prelu2 = nn.PReLU()
@@ -275,7 +279,6 @@ class StateAggregationDecoder(nn.Module):
                 self.state_dict(), f"{run_name}/models/state_aggregation_decoder.pt"
             )
 
-
 class StateAggregationAutoencoder(nn.Module):
     def __init__(self, env: gym.Env, latent_size=64, alpha=0.99):
         super(StateAggregationAutoencoder, self).__init__()
@@ -292,7 +295,7 @@ class StateAggregationAutoencoder(nn.Module):
     
     def forward(self, state):
         encoder_out = self.encoder(state)
-        current_state_pred, next_state_pred = self.decoder(encoder_out)
+        current_state_pred, next_state_pred= self.decoder(encoder_out)
         return encoder_out, current_state_pred, next_state_pred
 
     def update_running_average(self, current, new_value):
@@ -318,15 +321,15 @@ class StateAggregationAutoencoder(nn.Module):
             self.running_avg_loss_next = self.update_running_average(
                 self.running_avg_loss_next, loss_next_state.detach()
             )
-            self.running_avg_return = self.update_running_average(
-                self.running_avg_return, episodic_return_mean.detach()
-            )
+            # self.running_avg_return = self.update_running_average(
+            #     self.running_avg_return, episodic_return_mean.detach()
+            # )
         
         # Scale losses by running averages
         scaled_loss_current = loss_current_state / (self.running_avg_loss_current + 1e-8)
         scaled_loss_next = loss_next_state / (self.running_avg_loss_next + 1e-8)
-        scaled_return = episodic_return.mean() / (self.running_avg_return + 1e-8)
-        return (scaled_loss_current + scaled_loss_next) - scaled_return
+        # scaled_return = episodic_return.mean() / (self.running_avg_return + 1e-8)
+        return (scaled_loss_current + scaled_loss_next)
 
     def save(self, path=None):
         self.encoder.save()
@@ -465,11 +468,8 @@ class ExplorationCritic(nn.Module):
             nn.ReLU(),
             nn.Linear(transformer_embedding_size // 2, 1),
         )
-
-    def compute_loss(self):
-        pass
     
-    def forward(self, latent_state, latent_next_state, action, exploration_buffer_seq):
+    def forward(self, latent_state, action, latent_next_state, exploration_buffer_seq):
         # Embed latent state, action, latent next state,
         current_state_token = self.state_embedding(latent_state)
         action_token = self.action_embedding(action)
@@ -889,7 +889,6 @@ class ECNTrainer:
                 episodic_return,
                 self.autoencoder_regularization_coefficient,
             )
-
             optimizer.zero_grad()
             loss.backward(retain_graph=True)
             optimizer.step()
@@ -957,8 +956,13 @@ class ECNTrainer:
             buffer_seq_list.append(concatenated)
         
         exploration_buffer_seq = torch.stack(buffer_seq_list)
-        
         exploration_score = self.exploration_critic(latent_state, action, latent_next_state, exploration_buffer_seq)
+        distance = torch.linalg.norm(latent_next_state - latent_state)
+        loss = F.mse_loss(exploration_score, distance)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
         
     def train(self):
         self.state_value_net.eval()
@@ -1039,7 +1043,7 @@ class ECNTrainer:
 
             # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
             obs = next_obs
-
+            self.train_single_step_exploration_critic(encoded_obs, actions.squeeze(0), encoded_next_obs)
             if global_step > self.learning_starts:
                 data = self.replay_buffer.sample(self.actor_critic_batch_size)
                 encoded_data_obs = self.autoencoder.encoder(data.observations)
