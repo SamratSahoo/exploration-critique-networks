@@ -20,6 +20,7 @@ import stable_baselines3 as sb3
 from sys import platform
 
 os.environ["MUJOCO_GL"] = "glfw" if platform == "darwin" else "osmesa"
+torch.autograd.set_detect_anomaly(True)
 
 @dataclass
 class Args:
@@ -396,10 +397,11 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("positional_encoding", positional_encoding)
 
     def forward(self, exploration_buffer_seq):
-        exploration_buffer_seq += self.positional_encoding[
+        # Create a new tensor instead of modifying in-place
+        result = exploration_buffer_seq + self.positional_encoding[
             : exploration_buffer_seq.size(0)
         ]
-        return exploration_buffer_seq
+        return self.dropout(result)
 
 
 class ExplorationBuffer:
@@ -412,7 +414,7 @@ class ExplorationBuffer:
         )
         
     def get_last_k_elements(self, k):
-        return self.buffer[max(len(self.buffer) - k, 0):]
+        return list(self.buffer)[max(len(self.buffer) - k, 0):]
 
 
 class ExplorationCritic(nn.Module):
@@ -476,16 +478,21 @@ class ExplorationCritic(nn.Module):
         next_state_token = self.state_embedding(latent_next_state)
 
         # Embed + add positional encoding to exploration buffer sequence
-        expl_buffer_token = self.exploration_embedding(exploration_buffer_seq)
-        pos_expl_buffer_token = self.positional_encoding(expl_buffer_token)
-
+        expl_buffer_token = self.exploration_embedding(exploration_buffer_seq.unsqueeze(0))
+        expl_buffer_token = expl_buffer_token.transpose(0, 1)
+        # Clone to avoid in-place modification from positional encoding
+        pos_expl_buffer_token = self.positional_encoding(expl_buffer_token.clone())
+        
         # Create query
-        query = torch.cat([current_state_token, action_token, next_state_token], dim=0)
-
+        query = torch.cat([
+            current_state_token.unsqueeze(0),
+            action_token.unsqueeze(0),
+            next_state_token.unsqueeze(0)
+        ], dim=0)
         # Get cross attention
-        cross_attention_out = self.cross_attention(query, pos_expl_buffer_token)
+        cross_attention_out = self.cross_attention(query, pos_expl_buffer_token.squeeze(1))
         aggregate_cross = cross_attention_out.mean(dim=0)
-        exploration_score = self.fc_out(aggregate_cross).squeeze(-1)
+        exploration_score = self.fc_out(aggregate_cross)
         return exploration_score
 
     def save(self, path=None):
@@ -607,6 +614,7 @@ class ECNTrainer:
         # Counters for logging
         self.state_value_net_loss_counter = 0
         self.state_aggregation_autoencoder_loss_counter = 0
+        self.exploration_critic_loss_counter = 0
         
         # Exploration critic hyperparameters
         self.exploration_buffer_num_experiences = 50
@@ -890,7 +898,7 @@ class ECNTrainer:
                 self.autoencoder_regularization_coefficient,
             )
             optimizer.zero_grad()
-            loss.backward(retain_graph=True)
+            loss.backward()
             optimizer.step()
 
             writer.add_scalar(
@@ -941,8 +949,9 @@ class ECNTrainer:
         self.state_value_net.eval()
 
     def train_single_step_exploration_critic(self, latent_state, action, latent_next_state):
+        self.exploration_critic.train()
         optimizer = optim.Adam(
-            list(self.exploration_critic.parameters()), lr=self.critic_learning_rate
+            list(self.exploration_critic.parameters()), lr=self.exploration_critic_learning_rate
         )
         recent_experiences = self.exploration_buffer.get_last_k_elements(self.exploration_buffer_num_experiences)
         if len(recent_experiences) < self.exploration_buffer_num_experiences:
@@ -950,19 +959,30 @@ class ECNTrainer:
                 print(f"Training Exploration Critic: Insufficient experience: Current - {len(recent_experiences)}, Need - {self.exploration_buffer_num_experiences}")
             return
         
+        # Create a copy of the tensors to avoid in-place modification issues
+        latent_state_copy = latent_state.clone().detach().requires_grad_(True)
+        action_copy = action.clone().detach().requires_grad_(True)
+        latent_next_state_copy = latent_next_state.clone().detach().requires_grad_(True)
+        
         buffer_seq_list = []
         for exp in recent_experiences:
-            concatenated = torch.cat([exp.latent_state, exp.action, exp.latent_next_state], dim=-1)
+            # Clone and detach exploration buffer entries to prevent in-place modifications
+            exp_state = exp.latent_state.clone().detach()
+            exp_action = exp.action.clone().detach()
+            exp_next_state = exp.latent_next_state.clone().detach()
+            concatenated = torch.cat([exp_state, exp_action, exp_next_state], dim=-1)
             buffer_seq_list.append(concatenated)
-        
         exploration_buffer_seq = torch.stack(buffer_seq_list)
-        exploration_score = self.exploration_critic(latent_state, action, latent_next_state, exploration_buffer_seq)
+        
+        exploration_score = self.exploration_critic(latent_state_copy, action_copy, latent_next_state_copy, exploration_buffer_seq)
         distance = torch.linalg.norm(latent_next_state - latent_state)
         loss = F.mse_loss(exploration_score, distance)
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        writer.add_scalar("Loss/exploration_critic_loss", loss, self.exploration_critic_loss_counter)
+        self.exploration_critic.eval()
         
     def train(self):
         self.state_value_net.eval()
@@ -1009,7 +1029,12 @@ class ECNTrainer:
             next_obs, rewards, terminations, truncations, infos = self.env.step(actions)
             
             encoded_next_obs = self.autoencoder.encoder(torch.tensor(next_obs, dtype=torch.float32))
-            self.exploration_buffer.add(encoded_obs, actions.squeeze(0), encoded_next_obs)
+            self.exploration_buffer.add(
+                encoded_obs.squeeze(0), 
+                torch.tensor(actions, dtype=torch.float32).squeeze(0), 
+                encoded_next_obs.squeeze(0)
+            )
+
             current_episode_states.append(obs.squeeze(0))
             current_episode_rewards.append(rewards.squeeze(0))
             current_episode_next_states.append(next_obs.squeeze(0))
@@ -1043,7 +1068,11 @@ class ECNTrainer:
 
             # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
             obs = next_obs
-            self.train_single_step_exploration_critic(encoded_obs, actions.squeeze(0), encoded_next_obs)
+            self.train_single_step_exploration_critic(
+                encoded_obs.detach().squeeze(0), 
+                torch.tensor(actions, dtype=torch.float32, device=device).squeeze(0), 
+                encoded_next_obs.detach().squeeze(0)
+            )
             if global_step > self.learning_starts:
                 data = self.replay_buffer.sample(self.actor_critic_batch_size)
                 encoded_data_obs = self.autoencoder.encoder(data.observations)
@@ -1067,10 +1096,16 @@ class ECNTrainer:
                 critic_optimizer.step()
 
                 if global_step % self.policy_update_frequency == 0:
-                    actor_action = self.actor(encoded_data_obs)                    
+                    actor_action = self.actor(encoded_data_obs) 
+                    exploration_critic_score = self.exploration_critic(
+                        encoded_data_obs, 
+                        actor_action, 
+                        encoded_data_next_obs, 
+                        self.exploration_buffer.get_last_k_elements(self.exploration_buffer_num_experiences)
+                    )                   
                     actor_loss = -self.critic(
                         data.observations, actor_action,
-                    ).mean()
+                    ).mean() + exploration_critic_score
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
                     actor_optimizer.step()
