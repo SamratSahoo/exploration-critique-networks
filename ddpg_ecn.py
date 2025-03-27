@@ -12,12 +12,17 @@ import torch.nn.functional as F
 import torch.optim as optim
 import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
-from collections import deque, namedtuple
-import math
 from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import TensorDataset, DataLoader, Dataset
-import stable_baselines3 as sb3
+from torch.utils.data import TensorDataset, DataLoader
 from sys import platform
+
+# Models
+from ecn.models.critic import Critic
+from ecn.models.state_aggregation_autoencoder import StateAggregationAutoencoder
+from ecn.models.state_value_approximator import StateValueApproximator
+from ecn.models.actor import Actor
+from ecn.models.exploration_critic import ExplorationCritic
+from ecn.utils import ExplorationBuffer, RolloutDataset
 
 os.environ["MUJOCO_GL"] = "glfw" if platform == "darwin" else "osmesa"
 torch.autograd.set_detect_anomaly(True)
@@ -102,404 +107,6 @@ envs = gym.vector.SyncVectorEnv(
     [make_env(args.env_id, args.seed, 0, args.capture_video, run_name)],
     autoreset_mode=gym.vector.vector_env.AutoresetMode.SAME_STEP,
 )
-
-ExplorationBufferElement = namedtuple(
-    "ExplorationBufferElement", "latent_state action latent_next_state"
-)
-
-
-class RolloutDataset(Dataset):
-    def __init__(self, states_np, returns_np, next_states_np, episodic_returns):
-        """
-        Custom PTyorch dataset to store rollout data.
-
-        Args:
-        - states_np (numpy.ndarray): Current states
-        - returns_np (numpy.ndarray): Corresponding returns
-        - next_states_np (numpy.ndarray): Next states
-        - episodic_returns (numpy.ndarray): Next states
-        """
-        self.states = torch.tensor(states_np, dtype=torch.float32)
-        self.returns = torch.tensor(returns_np, dtype=torch.float32)
-        self.next_states = torch.tensor(next_states_np, dtype=torch.float32)
-        self.episodic_returns = torch.tensor(episodic_returns, dtype=torch.float32)
-
-    def __len__(self):
-        return len(self.states)
-
-    def __getitem__(self, idx):
-        return (
-            self.states[idx],
-            self.returns[idx],
-            self.next_states[idx],
-            self.episodic_returns[idx],
-        )
-
-
-class StateValueApproximator(nn.Module):
-    def __init__(self, env):
-        super().__init__()
-        self.fc1 = nn.Linear(
-            np.array(env.single_observation_space.shape).prod(),
-            512,
-        )
-        self.fc2 = nn.Linear(512, 256)
-        self.fc3 = nn.Linear(256, 1)
-
-        self.bn1 = nn.BatchNorm1d(512)
-        self.bn2 = nn.BatchNorm1d(256)
-
-    def forward(self, state):
-        x = self.fc1(state)
-        x = self.bn1(x)
-        x = F.relu(x)
-
-        x = self.fc2(x)
-        x = self.bn2(x)
-        x = F.relu(x)
-        x = self.fc3(x)
-        return x
-
-    def save(self, path=None):
-        if path:
-            torch.save(self.state_dict(), path)
-        else:
-            torch.save(
-                self.state_dict(), f"{run_name}/models/state_value_approximator.pt"
-            )
-
-
-class Critic(nn.Module):
-    def __init__(self, env, latent_size=64):
-        super().__init__()
-        self.fc1 = nn.Linear(
-            np.prod(env.single_observation_space.shape)
-            + np.prod(env.single_action_space.shape),
-            256,
-        )
-        self.fc2 = nn.Linear(256, 256)
-        self.fc3 = nn.Linear(256, 1)
-
-    def forward(self, x, a):
-        x = torch.cat([x, a], 1)
-        x = self.fc1(x)
-        x = F.relu(x)
-
-        x = self.fc2(x)
-        x = F.relu(x)
-        x = self.fc3(x)
-        return x
-
-    def save(self, path=None):
-        if path:
-            torch.save(self.state_dict(), path)
-        else:
-            torch.save(self.state_dict(), f"{run_name}/models/critic.pt")
-
-
-class StateAggregationEncoder(nn.Module):
-    def __init__(self, env, latent_size=64):
-        super(StateAggregationEncoder, self).__init__()
-        self.latent_size = latent_size
-
-        # Input Shape is flattened state space + State Value
-        self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 256)
-        self.batch_norm_1 = nn.BatchNorm1d(256)
-        self.fc2 = nn.Linear(256, 128)
-        self.batch_norm_2 = nn.BatchNorm1d(128)
-        self.fc3 = nn.Linear(128, self.latent_size)
-        self.batch_norm_3 = nn.BatchNorm1d(self.latent_size)
-
-        self.prelu1 = nn.PReLU()
-        self.prelu2 = nn.PReLU()
-
-    def forward(self, state):
-        x = self.fc1(state)
-        x = self.batch_norm_1(x)
-        x = self.prelu1(x)
-
-        x = self.fc2(x)
-        x = self.batch_norm_2(x)
-        x = self.prelu2(x)
-
-        x = self.fc3(x)
-        x = self.batch_norm_3(x)
-
-        return x
-
-    def save(self, path=None):
-        if path:
-            torch.save(self.state_dict(), path)
-        else:
-            torch.save(
-                self.state_dict(), f"{run_name}/models/state_aggregation_encoder.pt"
-            )
-
-
-class StateAggregationDecoder(nn.Module):
-    def __init__(self, env, latent_size=64):
-        super(StateAggregationDecoder, self).__init__()
-
-        self.latent_size = latent_size
-
-        self.fc1 = nn.Linear(self.latent_size, 128)
-        self.batch_norm_1 = nn.BatchNorm1d(128)
-        self.fc2 = nn.Linear(128, 256)
-        self.batch_norm_2 = nn.BatchNorm1d(256)
-        self.fc3 = nn.Linear(256, np.array(env.single_observation_space.shape).prod())
-
-        self.transition_head = nn.Linear(
-            256, np.array(env.single_observation_space.shape).prod()
-        )
-        
-        self.episodic_return_head = nn.Linear(
-            256, np.array(env.single_observation_space.shape).prod()
-        )
-
-        self.prelu1 = nn.PReLU()
-        self.prelu2 = nn.PReLU()
-
-    def forward(self, latent_state):
-        x = self.fc1(latent_state)
-        x = self.batch_norm_1(x)
-        x = self.prelu1(x)
-
-        x = self.fc2(x)
-        x = self.batch_norm_2(x)
-        x = self.prelu2(x)
-
-        current_state_pred = self.fc3(x)
-        next_state_pred = self.transition_head(x)
-        return current_state_pred, next_state_pred
-
-    def save(self, path=None):
-        if path:
-            torch.save(self.state_dict(), path)
-        else:
-            torch.save(
-                self.state_dict(), f"{run_name}/models/state_aggregation_decoder.pt"
-            )
-
-class StateAggregationAutoencoder(nn.Module):
-    def __init__(self, env: gym.Env, latent_size=64, alpha=0.99):
-        super(StateAggregationAutoencoder, self).__init__()
-
-        self.encoder = StateAggregationEncoder(env, latent_size=latent_size)
-        self.decoder = StateAggregationDecoder(env, latent_size=latent_size)
-        
-        # Running averages for loss scaling
-        self.register_buffer("running_avg_loss_current", torch.tensor(1.0))
-        self.register_buffer("running_avg_loss_next", torch.tensor(1.0))
-        self.register_buffer("running_avg_return", torch.tensor(1.0))
-        
-        self.alpha = alpha  # Smoothing factor for EMA
-    
-    def forward(self, state):
-        encoder_out = self.encoder(state)
-        current_state_pred, next_state_pred= self.decoder(encoder_out)
-        return encoder_out, current_state_pred, next_state_pred
-
-    def update_running_average(self, current, new_value):
-        return self.alpha * current + (1 - self.alpha) * new_value
-
-    def compute_loss(
-        self,
-        encoder_out,
-        next_state_pred,
-        next_states,
-        current_state_pred,
-        current_state,
-        episodic_return,
-        autoencoder_regularization_coefficient,
-    ):
-        loss_current_state = F.mse_loss(current_state_pred, current_state)
-        loss_next_state = F.mse_loss(next_state_pred, next_states)
-        episodic_return_mean = torch.tensor(episodic_return.mean(), device=loss_current_state.device)
-        with torch.no_grad():
-            self.running_avg_loss_current = self.update_running_average(
-                self.running_avg_loss_current, loss_current_state.detach()
-            )
-            self.running_avg_loss_next = self.update_running_average(
-                self.running_avg_loss_next, loss_next_state.detach()
-            )
-            # self.running_avg_return = self.update_running_average(
-            #     self.running_avg_return, episodic_return_mean.detach()
-            # )
-        
-        # Scale losses by running averages
-        scaled_loss_current = loss_current_state / (self.running_avg_loss_current + 1e-8)
-        scaled_loss_next = loss_next_state / (self.running_avg_loss_next + 1e-8)
-        # scaled_return = episodic_return.mean() / (self.running_avg_return + 1e-8)
-        return (scaled_loss_current + scaled_loss_next)
-
-    def save(self, path=None):
-        self.encoder.save()
-        self.decoder.save()
-
-        if path:
-            torch.save(self.state_dict(), path)
-        else:
-            torch.save(
-                self.state_dict(), f"{run_name}/models/state_aggregation_autoencoder.pt"
-            )
-
-
-# Actor by default works in latent space
-class Actor(nn.Module):
-    def __init__(self, env, latent_size=64):
-        super().__init__()
-        self.fc1 = nn.Linear(latent_size, 256)
-        self.fc2 = nn.Linear(256, 256)
-        self.fc_mu = nn.Linear(256, np.prod(env.single_action_space.shape))
-
-        self.register_buffer(
-            "action_scale",
-            torch.tensor(
-                (env.action_space.high - env.action_space.low) / 2.0,
-                dtype=torch.float32,
-            ),
-        )
-        self.register_buffer(
-            "action_bias",
-            torch.tensor(
-                (env.action_space.high + env.action_space.low) / 2.0,
-                dtype=torch.float32,
-            ),
-        )
-
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = torch.tanh(self.fc_mu(x))
-        return x * self.action_scale + self.action_bias
-
-    def save(self, path=None):
-        if path:
-            torch.save(self.state_dict(), path)
-        else:
-            torch.save(self, f"{run_name}/models/actor.pt")
-
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, embedding_size, length, dropout=0.1):
-        super(PositionalEncoding, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        positional_encoding = torch.zeros(length, embedding_size)
-        position = torch.arange(0, length, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, embedding_size, 2) * (-math.log(10000.0) / embedding_size)
-        )
-
-        positional_encoding[:, 0::2] = torch.sin(position * div_term)
-        positional_encoding[:, 1::2] = torch.cos(position * div_term)
-
-        positional_encoding = positional_encoding.unsqueeze(1)
-        self.register_buffer("positional_encoding", positional_encoding)
-
-    def forward(self, exploration_buffer_seq):
-        # Create a new tensor instead of modifying in-place
-        result = exploration_buffer_seq + self.positional_encoding[
-            : exploration_buffer_seq.size(0)
-        ]
-        return self.dropout(result)
-
-
-class ExplorationBuffer:
-    def __init__(self, maxlen=5000):
-        self.buffer = deque(maxlen=maxlen)
-
-    def add(self, latent_state, action, latent_next_state):
-        self.buffer.append(
-            ExplorationBufferElement(latent_state, action, latent_next_state)
-        )
-        
-    def get_last_k_elements(self, k):
-        return list(self.buffer)[max(len(self.buffer) - k, 0):]
-
-
-class ExplorationCritic(nn.Module):
-
-    def __init__(
-        self,
-        env,
-        latent_state_size=64,
-        transformer_embedding_size=128,
-        max_seq_len=50,
-        heads=8,
-    ):
-        """
-        Args:
-            latent_state_size (int, optional): Size of latent state created from the State Aggregation Module. Defaults to 64.
-            transformer_embedding_size (int, optional): Size of transformer embedding. Defaults to 128.
-            max_seq_len (int, optional): Number of elements you want to consider from the exploration buffer. Defaults to 50.
-            nheads (int, optional): Number of transformer heads
-        """
-        super(ExplorationCritic, self).__init__()
-        # Embedding for state tokens
-        self.state_embedding = nn.Linear(latent_state_size, transformer_embedding_size)
-        # Embedding for action tokens
-        self.action_embedding = nn.Linear(
-            np.array(env.single_action_space.shape).prod(), transformer_embedding_size
-        )
-        # Embedding for exploration buffer tokens
-        self.exploration_embedding = nn.Linear(
-            2*latent_state_size + np.array(env.single_action_space.shape).prod(),
-            transformer_embedding_size,
-        )
-
-        # Positional encoding layer for exploration buffer
-        self.positional_encoding = PositionalEncoding(
-            embedding_size=transformer_embedding_size, length=max_seq_len
-        )
-
-        # Encoding layer for exploration buffer
-        encode_layer = nn.TransformerEncoderLayer(
-            d_model=transformer_embedding_size, nhead=heads
-        )
-        self.exploration_transfromer = nn.TransformerEncoder(encode_layer, num_layers=8)
-
-        # Cross Attention layer between exploration buffer sequence and current state/action/next state sequence
-        # Evaluates novelty of current exploration in reference to previous experience
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=transformer_embedding_size, nhead=heads
-        )
-        self.cross_attention = nn.TransformerDecoder(decoder_layer, num_layers=1)
-
-        self.fc_out = nn.Sequential(
-            nn.Linear(transformer_embedding_size, transformer_embedding_size // 2),
-            nn.ReLU(),
-            nn.Linear(transformer_embedding_size // 2, 1),
-        )
-    
-    def forward(self, latent_state, action, latent_next_state, exploration_buffer_seq):
-        # Embed latent state, action, latent next state,
-        current_state_token = self.state_embedding(latent_state)
-        action_token = self.action_embedding(action)
-        next_state_token = self.state_embedding(latent_next_state)
-
-        # Embed + add positional encoding to exploration buffer sequence
-        expl_buffer_token = self.exploration_embedding(exploration_buffer_seq.unsqueeze(0))
-        expl_buffer_token = expl_buffer_token.transpose(0, 1)
-        # Clone to avoid in-place modification from positional encoding
-        pos_expl_buffer_token = self.positional_encoding(expl_buffer_token.clone())
-        
-        # Create query
-        query = torch.cat([
-            current_state_token.unsqueeze(0),
-            action_token.unsqueeze(0),
-            next_state_token.unsqueeze(0)
-        ], dim=0)
-        # Get cross attention
-        cross_attention_out = self.cross_attention(query, pos_expl_buffer_token.squeeze(1))
-        aggregate_cross = cross_attention_out.mean(dim=0)
-        exploration_score = self.fc_out(aggregate_cross)
-        return exploration_score
-
-    def save(self, path=None):
-        if not path:
-            torch.save(self.state_dict(), f"{run_name}/models/exploration_critic.pt")
-        else:
-            torch.save(self.state_dict(), path)
 
 class ECNTrainer:
     def __init__(
@@ -740,7 +347,7 @@ class ECNTrainer:
                 )
                 self.state_value_net_loss_counter += 1
 
-        self.state_value_net.save()
+        self.state_value_net.save(run_name=run_name)
         self.state_value_net.eval()
 
     def train_baseline_state_aggregation_module(self):
@@ -866,8 +473,8 @@ class ECNTrainer:
             print(f"Final Test Loss: {test_loss}")
 
         self.state_value_net.train()
-        self.autoencoder.save()
-        self.autoencoder.eval()
+        self.autoencoder.save(run_name=run_name)
+        self.autoencoder.eval(run_name=run_name)
 
     def train_single_step_state_aggregation_module(
         self, observations, next_observations, episodic_return
@@ -1140,8 +747,10 @@ class ECNTrainer:
 
 
         self.env.close()
-        self.actor.save()
-        self.critic.save()
+        self.actor.save(run_name=run_name)
+        self.critic.save(run_name=run_name)
+        self.exploration_critic.save(run_name=run_name)
+        self.autoencoder.save(run_name=run_name)
         self.state_value_net.train()
         self.autoencoder.train()
 
