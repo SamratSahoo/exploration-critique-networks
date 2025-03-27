@@ -982,6 +982,7 @@ class ECNTrainer:
         loss.backward()
         optimizer.step()
         writer.add_scalar("Loss/exploration_critic_loss", loss, self.exploration_critic_loss_counter)
+        self.exploration_critic_loss_counter += 1
         self.exploration_critic.eval()
         
     def train(self):
@@ -1105,7 +1106,7 @@ class ECNTrainer:
                     )                   
                     actor_loss = -self.critic(
                         data.observations, actor_action,
-                    ).mean() + exploration_critic_score
+                    ).mean() - exploration_critic_score
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
                     actor_optimizer.step()
