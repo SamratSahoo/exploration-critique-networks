@@ -102,8 +102,20 @@ class StateAggregationAutoencoder(nn.Module):
         self.alpha = alpha  # Smoothing factor for EMA
     
     def forward(self, state):
+        # Set batch normalization to eval mode during forward passes if not training
+        train_mode = self.training
+        if not train_mode:
+            self.encoder.eval()
+            self.decoder.eval()
+        
         encoder_out = self.encoder(state)
-        current_state_pred, next_state_pred= self.decoder(encoder_out)
+        current_state_pred, next_state_pred = self.decoder(encoder_out)
+        
+        # Restore original training mode
+        if not train_mode:
+            self.encoder.train(train_mode)
+            self.decoder.train(train_mode)
+        
         return encoder_out, current_state_pred, next_state_pred
 
     def update_running_average(self, current, new_value):
@@ -119,9 +131,14 @@ class StateAggregationAutoencoder(nn.Module):
         episodic_return,
         autoencoder_regularization_coefficient,
     ):
-        loss_current_state = F.mse_loss(current_state_pred, current_state)
-        loss_next_state = F.mse_loss(next_state_pred, next_states)
+        # Clone tensors to avoid in-place modifications
+        current_state_clone = current_state.clone()
+        next_states_clone = next_states.clone()
+        
+        loss_current_state = F.mse_loss(current_state_pred, current_state_clone)
+        loss_next_state = F.mse_loss(next_state_pred, next_states_clone)
         episodic_return_mean = torch.tensor(episodic_return.mean(), device=loss_current_state.device)
+        
         with torch.no_grad():
             self.running_avg_loss_current = self.update_running_average(
                 self.running_avg_loss_current, loss_current_state.detach()

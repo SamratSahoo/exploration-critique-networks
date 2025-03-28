@@ -83,50 +83,89 @@ class ExplorationCritic(nn.Module):
         )
     
     def forward(self, latent_state, action, latent_next_state, exploration_buffer_seq):
-        current_state_token = self.state_embedding(latent_state)
-        action_token = self.action_embedding(action)
-        next_state_token = self.state_embedding(latent_next_state)
-        expl_buffer_token = self.exploration_embedding(exploration_buffer_seq)
-
-        if expl_buffer_token.dim() == 2:
-            # Add batch dimension
-            expl_buffer_token = expl_buffer_token.unsqueeze(1)
-        else:
-            # Swap seq len and batch dimension
+        # Check if inputs have batch dimension
+        has_batch = latent_state.dim() > 1
+        
+        # Handle inputs with shape flexibility
+        if not has_batch:
+            # Add batch dimension if not present
+            latent_state = latent_state.unsqueeze(0)
+            action = action.unsqueeze(0)
+            latent_next_state = latent_next_state.unsqueeze(0)
+            if exploration_buffer_seq.dim() == 2:
+                exploration_buffer_seq = exploration_buffer_seq.unsqueeze(0)
+        
+        batch_size = latent_state.shape[0]
+        
+        # Apply embeddings
+        current_state_token = self.state_embedding(latent_state)         # [B, embed_dim]
+        action_token = self.action_embedding(action)                     # [B, embed_dim]
+        next_state_token = self.state_embedding(latent_next_state)       # [B, embed_dim]
+        
+        # Prepare exploration buffer sequence
+        if exploration_buffer_seq.dim() == 3:  # [B, seq_len, feature_dim]
+            # Apply exploration embedding
+            expl_buffer_token = self.exploration_embedding(exploration_buffer_seq)  # [B, seq_len, embed_dim]
+            # Reshape to [seq_len, B, embed_dim] for transformer
             expl_buffer_token = expl_buffer_token.transpose(0, 1)
-
-        pos_expl_buffer_token = self.positional_encoding(expl_buffer_token.clone())
+        else:  # [seq_len, B, feature_dim]
+            expl_buffer_token = self.exploration_embedding(exploration_buffer_seq)
+        
+        # Apply positional encoding
+        pos_expl_buffer_token = self.positional_encoding(expl_buffer_token)
+        
+        # Prepare query tensor: [3, B, embed_dim]
         query = torch.stack([current_state_token, action_token, next_state_token], dim=0)
         
-        if query.dim() == 2:
-            cross_attention_out = self.cross_attention(query, pos_expl_buffer_token.squeeze(1))
-        else:
-            query = query.transpose(0, 1)
-            pos_expl_buffer_token = pos_expl_buffer_token.transpose(0, 1)
-            cross_attention_out = self.cross_attention(query, pos_expl_buffer_token)
-        aggregate_cross = cross_attention_out.mean(dim=0)
+        # Cross attention between current transition and exploration buffer
+        cross_attention_out = self.cross_attention(query, pos_expl_buffer_token)  # [3, B, embed_dim]
         
-        exploration_score = self.fc_out(aggregate_cross)
+        # Aggregate over sequence dimension
+        aggregate_cross = cross_attention_out.mean(dim=0)  # [B, embed_dim]
+        
+        # Final projection
+        exploration_score = self.fc_out(aggregate_cross)  # [B, 1]
+        
+        # Return appropriate shape based on input
+        if not has_batch:
+            return exploration_score.squeeze(0)
         return exploration_score
 
-    def run_inference(self, encoded_data_obs, actor_action, encoded_data_next_obs, recent_experiences):
-        if len(recent_experiences) >= self.max_seq_len:
-            buffer_seq_list = []
-            for exp in recent_experiences:
-                concatenated = torch.cat([exp.latent_state, exp.action, exp.latent_next_state], dim=-1)
-                buffer_seq_list.append(concatenated)
-            exploration_buffer_seq = torch.stack(buffer_seq_list)
-            exploration_critic_score = self(
-                encoded_data_obs, 
-                actor_action, 
-                encoded_data_next_obs, 
-                exploration_buffer_seq.unsqueeze(0)
-            ) 
-        else:
-            exploration_critic_score = torch.scalar_tensor(0)
+    def run_inference(self, encoded_data_obs, actor_action, encoded_data_next_obs, trajectory):
+        """
+        Run inference using trajectory data from the TrajectoryReplayBuffer
         
-        return exploration_critic_score
-
+        Args:
+            encoded_data_obs: Encoded observations (batch_size, obs_dim)
+            actor_action: Actions produced by the actor (batch_size, action_dim)
+            encoded_data_next_obs: Encoded next observations (batch_size, obs_dim)
+            trajectory: Trajectory object containing latent_states, actions, latent_next_states
+                        Each with shape (batch_size, seq_len, dim)
+                        
+        Returns:
+            Mean exploration critic score for the batch
+        """
+        if encoded_data_obs.shape[0] == 0:
+            return torch.tensor(0.0, device=encoded_data_obs.device)
+        
+        # Create the exploration buffer sequence for the entire batch
+        # Shape: [batch_size, seq_len, latent_dim + action_dim + latent_dim]
+        exploration_buffer_seq = torch.cat([
+            trajectory.latent_states,       # [batch_size, seq_len, latent_dim]
+            trajectory.actions,             # [batch_size, seq_len, action_dim]
+            trajectory.latent_next_states   # [batch_size, seq_len, latent_dim]
+        ], dim=2)
+        
+        # Process the entire batch at once
+        scores = self(
+            encoded_data_obs,
+            actor_action,
+            encoded_data_next_obs,
+            exploration_buffer_seq
+        )
+        
+        # Return mean score across the batch
+        return torch.mean(scores)
 
     def save(self, run_name=None, path=None):
         if not path:

@@ -22,7 +22,7 @@ from ecn.models.state_aggregation_autoencoder import StateAggregationAutoencoder
 from ecn.models.state_value_approximator import StateValueApproximator
 from ecn.models.actor import Actor
 from ecn.models.exploration_critic import ExplorationCritic
-from ecn.utils import ExplorationBuffer, RolloutDataset
+from ecn.utils import ExplorationBuffer, RolloutDataset, TrajectoryReplayBuffer
 
 os.environ["MUJOCO_GL"] = "glfw" if platform == "darwin" else "osmesa"
 torch.autograd.set_detect_anomaly(True)
@@ -202,11 +202,18 @@ class ECNTrainer:
         self.critic_learning_rate = 3e-4
         self.critic_batch_size = 128
 
-        self.replay_buffer = ReplayBuffer(
+        # Exploration critic hyperparameters
+        self.exploration_buffer_num_experiences = 50
+        self.exploration_critic_learning_rate = 1e-3
+
+        # Use the new TrajectoryReplayBuffer instead of ReplayBuffer
+        self.replay_buffer = TrajectoryReplayBuffer(
             replay_buffer_size,
             self.env.single_observation_space,
             self.env.single_action_space,
             device,
+            latent_size=self.latent_size,
+            trajectory_length=self.exploration_buffer_num_experiences,
             handle_timeout_termination=False,
         )
 
@@ -222,11 +229,6 @@ class ECNTrainer:
         self.state_value_net_loss_counter = 0
         self.state_aggregation_autoencoder_loss_counter = 0
         self.exploration_critic_loss_counter = 0
-        
-        # Exploration critic hyperparameters
-        self.exploration_buffer_num_experiences = 50
-        self.exploration_critic_learning_rate = 1e-3
-        
 
     def generate_rollouts(self, num_episodes=10):
         all_states = []
@@ -671,8 +673,10 @@ class ECNTrainer:
                     current_episode_rewards = []
                     current_episode_next_states = []
 
+            # Add both the raw observations and encoded observations to the replay buffer
             self.replay_buffer.add(
-                obs, real_next_obs, actions, rewards, terminations, infos
+                obs, real_next_obs, actions, rewards, terminations, infos,
+                encoded_obs=encoded_obs, encoded_next_obs=encoded_next_obs
             )
 
             # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
@@ -706,16 +710,20 @@ class ECNTrainer:
 
                 if global_step % self.policy_update_frequency == 0:
                     actor_action = self.actor(encoded_data_obs)
-                    recent_experiences = self.exploration_buffer.get_last_k_elements(self.exploration_buffer_num_experiences)
-                    exploration_critic_score = self.exploration_critic.run_inference(
-                        encoded_data_obs, 
-                        actor_action, 
-                        encoded_data_next_obs, 
-                        recent_experiences
-                    ) 
-                    actor_loss = -self.critic(
-                        data.observations, actor_action,
-                    ).mean() - exploration_critic_score
+                    with torch.no_grad():
+                        exploration_critic_score = self.exploration_critic.run_inference(
+                            encoded_data_obs.detach(), 
+                            actor_action.detach(), 
+                            encoded_data_next_obs.detach(), 
+                            data.trajectory
+                        )
+                    
+                    critic_value = self.critic(
+                        data.observations, actor_action
+                    ).mean()
+                    
+                    actor_loss = -critic_value - exploration_critic_score
+                    
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
                     actor_optimizer.step()
@@ -761,7 +769,7 @@ if __name__ == "__main__":
     ecn_trainer = ECNTrainer(
         envs,
         print_logs=False,
-        learning_starts=1000
+        learning_starts=51
         # state_value_net="./training_checkpoints/state_value_approximator.pt",
     )
     # ecn_trainer.train_baseline_state_value_network()
