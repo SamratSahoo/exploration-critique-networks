@@ -556,6 +556,7 @@ class ECNTrainer:
         self.state_value_net.eval()
 
     def train_single_step_exploration_critic(self, latent_state, action, latent_next_state):
+
         self.exploration_critic.train()
         optimizer = optim.Adam(
             list(self.exploration_critic.parameters()), lr=self.exploration_critic_learning_rate
@@ -704,13 +705,14 @@ class ECNTrainer:
                 critic_optimizer.step()
 
                 if global_step % self.policy_update_frequency == 0:
-                    actor_action = self.actor(encoded_data_obs) 
-                    exploration_critic_score = self.exploration_critic(
+                    actor_action = self.actor(encoded_data_obs)
+                    recent_experiences = self.exploration_buffer.get_last_k_elements(self.exploration_buffer_num_experiences)
+                    exploration_critic_score = self.exploration_critic.run_inference(
                         encoded_data_obs, 
                         actor_action, 
                         encoded_data_next_obs, 
-                        self.exploration_buffer.get_last_k_elements(self.exploration_buffer_num_experiences)
-                    )                   
+                        recent_experiences
+                    ) 
                     actor_loss = -self.critic(
                         data.observations, actor_action,
                     ).mean() - exploration_critic_score
@@ -758,7 +760,8 @@ class ECNTrainer:
 if __name__ == "__main__":
     ecn_trainer = ECNTrainer(
         envs,
-        print_logs=False
+        print_logs=False,
+        learning_starts=1000
         # state_value_net="./training_checkpoints/state_value_approximator.pt",
     )
     # ecn_trainer.train_baseline_state_value_network()

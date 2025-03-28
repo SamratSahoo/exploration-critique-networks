@@ -45,6 +45,7 @@ class ExplorationCritic(nn.Module):
             nheads (int, optional): Number of transformer heads
         """
         super(ExplorationCritic, self).__init__()
+        self.max_seq_len = max_seq_len
         # Embedding for state tokens
         self.state_embedding = nn.Linear(latent_state_size, transformer_embedding_size)
         # Embedding for action tokens
@@ -82,28 +83,50 @@ class ExplorationCritic(nn.Module):
         )
     
     def forward(self, latent_state, action, latent_next_state, exploration_buffer_seq):
-        # Embed latent state, action, latent next state,
         current_state_token = self.state_embedding(latent_state)
         action_token = self.action_embedding(action)
         next_state_token = self.state_embedding(latent_next_state)
+        expl_buffer_token = self.exploration_embedding(exploration_buffer_seq)
 
-        # Embed + add positional encoding to exploration buffer sequence
-        expl_buffer_token = self.exploration_embedding(exploration_buffer_seq.unsqueeze(0))
-        expl_buffer_token = expl_buffer_token.transpose(0, 1)
-        # Clone to avoid in-place modification from positional encoding
+        if expl_buffer_token.dim() == 2:
+            # Add batch dimension
+            expl_buffer_token = expl_buffer_token.unsqueeze(1)
+        else:
+            # Swap seq len and batch dimension
+            expl_buffer_token = expl_buffer_token.transpose(0, 1)
+
         pos_expl_buffer_token = self.positional_encoding(expl_buffer_token.clone())
+        query = torch.stack([current_state_token, action_token, next_state_token], dim=0)
         
-        # Create query
-        query = torch.cat([
-            current_state_token.unsqueeze(0),
-            action_token.unsqueeze(0),
-            next_state_token.unsqueeze(0)
-        ], dim=0)
-        # Get cross attention
-        cross_attention_out = self.cross_attention(query, pos_expl_buffer_token.squeeze(1))
+        if query.dim() == 2:
+            cross_attention_out = self.cross_attention(query, pos_expl_buffer_token.squeeze(1))
+        else:
+            query = query.transpose(0, 1)
+            pos_expl_buffer_token = pos_expl_buffer_token.transpose(0, 1)
+            cross_attention_out = self.cross_attention(query, pos_expl_buffer_token)
         aggregate_cross = cross_attention_out.mean(dim=0)
+        
         exploration_score = self.fc_out(aggregate_cross)
         return exploration_score
+
+    def run_inference(self, encoded_data_obs, actor_action, encoded_data_next_obs, recent_experiences):
+        if len(recent_experiences) >= self.max_seq_len:
+            buffer_seq_list = []
+            for exp in recent_experiences:
+                concatenated = torch.cat([exp.latent_state, exp.action, exp.latent_next_state], dim=-1)
+                buffer_seq_list.append(concatenated)
+            exploration_buffer_seq = torch.stack(buffer_seq_list)
+            exploration_critic_score = self(
+                encoded_data_obs, 
+                actor_action, 
+                encoded_data_next_obs, 
+                exploration_buffer_seq.unsqueeze(0)
+            ) 
+        else:
+            exploration_critic_score = torch.scalar_tensor(0)
+        
+        return exploration_critic_score
+
 
     def save(self, run_name=None, path=None):
         if not path:
