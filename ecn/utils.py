@@ -189,13 +189,17 @@ class TrajectoryReplayBuffer(ReplayBuffer):
             dummy_trajectory = TensorTrajectory(latent_states, actions, latent_next_states)
             return TrajectoryReplayBufferSamples(replay_samples, dummy_trajectory)
         
-        # Get trajectories for sampled indices
-        trajectory_batch = []
-        for i in batch_inds:
-            if 0 <= i < len(self.trajectory_buffer):
-                trajectory_batch.append(self.trajectory_buffer[i])
-            else:
-                trajectory_batch.append([self.empty_element] * self.trajectory_length)
+        # Filter valid indices within trajectory buffer range
+        valid_mask = np.logical_and(0 <= batch_inds, batch_inds < len(self.trajectory_buffer))
+        valid_inds = batch_inds[valid_mask]
+        
+        # Get trajectories using list comprehension for better efficiency
+        trajectory_batch = [self.trajectory_buffer[idx] for idx in valid_inds] if len(valid_inds) > 0 else []
+        
+        # Handle invalid indices
+        if len(valid_inds) < batch_size:
+            padding = [[self.empty_element] * self.trajectory_length] * (batch_size - len(valid_inds))
+            trajectory_batch.extend(padding)
         
         # Convert list of lists to tensor
         trajectory_tensor = self._convert_trajectories_to_tensor(trajectory_batch)
@@ -234,12 +238,17 @@ class TrajectoryReplayBuffer(ReplayBuffer):
             device=self.device
         )
         
-        # Fill tensors
+        # Stack trajectory elements more efficiently
         for i, trajectory in enumerate(trajectories):
-            for j, element in enumerate(trajectory):
-                latent_states[i, j] = element.latent_state
-                actions[i, j] = element.action
-                latent_next_states[i, j] = element.latent_next_state
+            # Extract states, actions, and next states from all elements in this trajectory
+            traj_states = torch.stack([element.latent_state for element in trajectory])
+            traj_actions = torch.stack([element.action for element in trajectory])
+            traj_next_states = torch.stack([element.latent_next_state for element in trajectory])
+            
+            # Assign all at once
+            latent_states[i] = traj_states
+            actions[i] = traj_actions
+            latent_next_states[i] = traj_next_states
         
         # Create a new structure similar to ExplorationBufferElement but using tensors
         class TensorTrajectory:
