@@ -216,6 +216,7 @@ class ECNTrainer:
             trajectory_length=self.exploration_buffer_num_experiences,
             handle_timeout_termination=False,
         )
+        self.exploration_critic_update_frequency = 10
 
         # Actor Critic Algorithm Hyperparameters
         self.actor_critic_timesteps = actor_critic_timesteps
@@ -615,11 +616,12 @@ class ECNTrainer:
             buffer_actions = torch.stack([exp.action for exp in recent_experiences])
             buffer_next_states = torch.stack([exp.latent_next_state for exp in recent_experiences])
             
+            # Reshape to [1, num_experiences, feature_dim] to add batch dimension
             exploration_buffer_seq = torch.cat([
-                buffer_states.view(len(recent_experiences), -1),
-                buffer_actions.view(len(recent_experiences), -1),
-                buffer_next_states.view(len(recent_experiences), -1)
-            ], dim=-1)
+                buffer_states,
+                buffer_actions,
+                buffer_next_states
+            ], dim=-1).unsqueeze(0)  # Add batch dimension
         
         loss = self.exploration_critic.compute_loss(latent_state, action, latent_next_state, exploration_buffer_seq)
 
@@ -628,7 +630,7 @@ class ECNTrainer:
         optimizer.step()
         
         writer.add_scalar("Loss/exploration_critic_loss", loss.item(), self.exploration_critic_loss_counter)
-        self.exploration_critic_loss_counter += 1
+        self.exploration_critic_loss_counter += self.exploration_critic_update_frequency
         
         self.exploration_critic.eval()
         
@@ -710,13 +712,11 @@ class ECNTrainer:
             for idx, is_done in enumerate(np.logical_or(terminations, truncations)):
                 if is_done:
                     real_next_obs[idx] = infos["final_obs"][idx]
-                    
-                    if global_step % 5 == 0:
-                        valid_states = current_episode_states[:episode_step]
-                        valid_next_states = current_episode_next_states[:episode_step]
-                        self.train_single_step_state_aggregation_module(
-                            valid_states, valid_next_states, infos["final_info"]["episode"]["r"][-1]
-                        )
+                    valid_states = current_episode_states[:episode_step]
+                    valid_next_states = current_episode_next_states[:episode_step]
+                    self.train_single_step_state_aggregation_module(
+                        valid_states, valid_next_states, infos["final_info"]["episode"]["r"][-1]
+                    )
                     episode_step = 0
 
             self.replay_buffer.add(
@@ -727,12 +727,11 @@ class ECNTrainer:
 
             obs = next_obs
             
-            if global_step % 10 == 0 and len(self.exploration_buffer.buffer) >= self.exploration_buffer_num_experiences:
-                with torch.no_grad():
-                    recent_exp = self.exploration_buffer.get_last_k_elements(1)[0]
-                    latent_state = recent_exp.latent_state
-                    action = recent_exp.action
-                    latent_next_state = recent_exp.latent_next_state
+            if global_step % self.exploration_critic_update_frequency == 0 and len(self.exploration_buffer.buffer) >= self.exploration_buffer_num_experiences:
+                recent_exp = self.exploration_buffer.get_last_k_elements(1)[0]
+                latent_state = recent_exp.latent_state
+                action = recent_exp.action
+                latent_next_state = recent_exp.latent_next_state
                 
                 self.train_single_step_exploration_critic(
                     latent_state, action, latent_next_state
@@ -756,21 +755,16 @@ class ECNTrainer:
 
                 if global_step % self.policy_update_frequency == 0:
                     actor_action = self.actor(data.trajectory.latent_states[:, -1])
+                    exploration_critic_score = self.exploration_critic.run_inference(
+                        data.trajectory.latent_states[:, -1],
+                        actor_action, 
+                        data.trajectory.latent_next_states[:, -1], 
+                        data.trajectory
+                    )
                     
-                    with torch.no_grad():
-                        # Use precomputed values from trajectory to avoid recomputation
-                        exploration_critic_score = self.exploration_critic.run_inference(
-                            data.trajectory.latent_states[:, -1],
-                            actor_action, 
-                            data.trajectory.latent_next_states[:, -1], 
-                            data.trajectory
-                        )
-                    
-                    # Use critic output directly
                     critic_value = self.critic(data.observations, actor_action).mean()
                     actor_loss = -critic_value * exploration_critic_score
 
-                    # Optimize actor
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
                     actor_optimizer.step()
@@ -779,7 +773,6 @@ class ECNTrainer:
                     if self.print_logs:
                         print(f"Training Actor Critic: Current timestep: {global_step}/{self.actor_critic_timesteps}, Actor Loss: {actor_loss.item()}, Critic Loss: {qf1_loss.item()}")
 
-                    # Target network updates (with inplace operations)
                     with torch.no_grad():
                         for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
                             target_param.data.mul_(1 - self.polyak_constant).add_(param.data, alpha=self.polyak_constant)

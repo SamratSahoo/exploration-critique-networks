@@ -114,9 +114,59 @@ class ExplorationCritic(nn.Module):
         return exploration_score
 
     def compute_loss(self, latent_state, action, latent_next_state, exploration_buffer_seq):
-        distance = torch.linalg.norm(latent_next_state - latent_state)
         exploration_score = self(latent_state, action, latent_next_state, exploration_buffer_seq)
-        loss = F.mse_loss(exploration_score, distance)
+        
+        # Make sure latent_state has batch dimension
+        if latent_state.dim() == 1:
+            latent_state = latent_state.unsqueeze(0)
+            action = action.unsqueeze(0)
+            latent_next_state = latent_next_state.unsqueeze(0)
+        
+        # Check if exploration buffer has elements and correct dimensions
+        if exploration_buffer_seq.dim() == 3 and exploration_buffer_seq.shape[1] > 0:
+            # Extract components from exploration buffer
+            latent_dim = latent_state.shape[-1]
+            action_dim = action.shape[-1]
+            
+            # Extract states, actions, and next states from buffer
+            buffer_states = exploration_buffer_seq[:, :, :latent_dim]
+            buffer_actions = exploration_buffer_seq[:, :, latent_dim:latent_dim+action_dim]
+            buffer_next_states = exploration_buffer_seq[:, :, -latent_dim:]
+            
+            # Prepare current transition and action for comparison
+            current_transition = latent_next_state - latent_state  # [B, latent_dim]
+            current_transition = current_transition.unsqueeze(1)  # [B, 1, latent_dim]
+            current_action = action.unsqueeze(1)  # [B, 1, action_dim]
+            
+            # Calculate state transition differences (vectorized)
+            buffer_transitions = buffer_next_states - buffer_states  # [B, seq_len, latent_dim]
+            transition_diffs = torch.linalg.norm(current_transition - buffer_transitions, dim=-1)  # [B, seq_len]
+            
+            # Calculate action differences (vectorized)
+            action_diffs = torch.linalg.norm(current_action - buffer_actions, dim=-1)  # [B, seq_len]
+            
+            # Normalize differences to balance their influence
+            norm_transition_diffs = transition_diffs / transition_diffs.clamp(min=1e-6).mean()
+            norm_action_diffs = action_diffs / action_diffs.clamp(min=1e-6).mean()
+            
+            # Combined similarity using both state transitions and actions
+            # Higher combined_diffs means lower similarity
+            combined_diffs = norm_transition_diffs + norm_action_diffs
+            similarities = 1.0 / (1.0 + combined_diffs)  # [B, seq_len]
+            
+            # Only use valid buffer entries (up to max_seq_len)
+            valid_length = min(self.max_seq_len, exploration_buffer_seq.shape[1])
+            similarities = similarities[:, :valid_length]
+            
+            # Average similarity across buffer entries
+            similarity = similarities.mean(dim=1, keepdim=True)  # [B, 1]
+            
+            # Target: high novelty = low similarity = high score
+            novelty_target = 1.0 - similarity
+            loss = F.mse_loss(exploration_score, novelty_target)
+        else:
+            loss = -exploration_score.mean()
+        
         return loss
     
     def run_inference(self, encoded_data_obs, actor_action, encoded_data_next_obs, trajectory):
