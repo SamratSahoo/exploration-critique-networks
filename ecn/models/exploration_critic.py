@@ -95,42 +95,30 @@ class ExplorationCritic(nn.Module):
             if exploration_buffer_seq.dim() == 2:
                 exploration_buffer_seq = exploration_buffer_seq.unsqueeze(0)
         
-        batch_size = latent_state.shape[0]
-        
-        # Apply embeddings
         current_state_token = self.state_embedding(latent_state)         # [B, embed_dim]
         action_token = self.action_embedding(action)                     # [B, embed_dim]
         next_state_token = self.state_embedding(latent_next_state)       # [B, embed_dim]
         
-        # Prepare exploration buffer sequence
-        if exploration_buffer_seq.dim() == 3:  # [B, seq_len, feature_dim]
-            # Apply exploration embedding
-            expl_buffer_token = self.exploration_embedding(exploration_buffer_seq)  # [B, seq_len, embed_dim]
-            # Reshape to [seq_len, B, embed_dim] for transformer
-            expl_buffer_token = expl_buffer_token.transpose(0, 1)
-        else:  # [seq_len, B, feature_dim]
-            expl_buffer_token = self.exploration_embedding(exploration_buffer_seq)
-        
-        # Apply positional encoding
+        expl_buffer_token = self.exploration_embedding(exploration_buffer_seq)  # [B, seq_len, embed_dim]
+        expl_buffer_token = expl_buffer_token.transpose(0, 1) # [seq_len, B, embed_dim]
+
         pos_expl_buffer_token = self.positional_encoding(expl_buffer_token)
-        
-        # Prepare query tensor: [3, B, embed_dim]
+        # query tensor: [3, B, embed_dim]
         query = torch.stack([current_state_token, action_token, next_state_token], dim=0)
-        
-        # Cross attention between current transition and exploration buffer
         cross_attention_out = self.cross_attention(query, pos_expl_buffer_token)  # [3, B, embed_dim]
-        
-        # Aggregate over sequence dimension
         aggregate_cross = cross_attention_out.mean(dim=0)  # [B, embed_dim]
-        
-        # Final projection
         exploration_score = self.fc_out(aggregate_cross)  # [B, 1]
         
-        # Return appropriate shape based on input
         if not has_batch:
             return exploration_score.squeeze(0)
         return exploration_score
 
+    def compute_loss(self, latent_state, action, latent_next_state, exploration_buffer_seq):
+        distance = torch.linalg.norm(latent_next_state - latent_state)
+        exploration_score = self(latent_state, action, latent_next_state, exploration_buffer_seq)
+        loss = F.mse_loss(exploration_score, distance)
+        return loss
+    
     def run_inference(self, encoded_data_obs, actor_action, encoded_data_next_obs, trajectory):
         """
         Run inference using trajectory data from the TrajectoryReplayBuffer

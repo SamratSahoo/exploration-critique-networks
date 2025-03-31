@@ -620,11 +620,8 @@ class ECNTrainer:
                 buffer_actions.view(len(recent_experiences), -1),
                 buffer_next_states.view(len(recent_experiences), -1)
             ], dim=-1)
-            
-            distance = torch.linalg.norm(latent_next_state - latent_state)
         
-        exploration_score = self.exploration_critic(latent_state, action, latent_next_state, exploration_buffer_seq)
-        loss = F.mse_loss(exploration_score, distance)
+        loss = self.exploration_critic.compute_loss(latent_state, action, latent_next_state, exploration_buffer_seq)
 
         optimizer.zero_grad()
         loss.backward()
@@ -636,7 +633,6 @@ class ECNTrainer:
         self.exploration_critic.eval()
         
         del recent_experiences, buffer_states, buffer_actions, buffer_next_states, exploration_buffer_seq
-        del exploration_score
 
     def train(self):
         self.state_value_net.eval()
@@ -772,8 +768,8 @@ class ECNTrainer:
                     
                     # Use critic output directly
                     critic_value = self.critic(data.observations, actor_action).mean()
-                    actor_loss = -critic_value - exploration_critic_score
-                    
+                    actor_loss = -critic_value * exploration_critic_score
+
                     # Optimize actor
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
