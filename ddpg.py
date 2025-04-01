@@ -117,8 +117,6 @@ class Actor(nn.Module):
 
 
 if __name__ == "__main__":
-    import stable_baselines3 as sb3
-
     args = tyro.cli(Args)
     run_name = f"runs/{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     os.makedirs(f"{run_name}/", exist_ok=True)

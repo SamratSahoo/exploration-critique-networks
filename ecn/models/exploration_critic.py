@@ -82,13 +82,10 @@ class ExplorationCritic(nn.Module):
             nn.Linear(transformer_embedding_size // 2, 1),
         )
     
-    def forward(self, latent_state, action, latent_next_state, exploration_buffer_seq):
+    def forward(self, latent_state, action, latent_next_state, exploration_buffer_seq, get_embedding=False):
         # Check if inputs have batch dimension
         has_batch = latent_state.dim() > 1
-        
-        # Handle inputs with shape flexibility
         if not has_batch:
-            # Add batch dimension if not present
             latent_state = latent_state.unsqueeze(0)
             action = action.unsqueeze(0)
             latent_next_state = latent_next_state.unsqueeze(0)
@@ -107,67 +104,60 @@ class ExplorationCritic(nn.Module):
         query = torch.stack([current_state_token, action_token, next_state_token], dim=0)
         cross_attention_out = self.cross_attention(query, pos_expl_buffer_token)  # [3, B, embed_dim]
         aggregate_cross = cross_attention_out.mean(dim=0)  # [B, embed_dim]
+        if get_embedding:
+            return aggregate_cross
+        
         exploration_score = self.fc_out(aggregate_cross)  # [B, 1]
         
         if not has_batch:
-            return exploration_score.squeeze(0)
-        return exploration_score
-
-    def compute_loss(self, latent_state, action, latent_next_state, exploration_buffer_seq):
-        exploration_score = self(latent_state, action, latent_next_state, exploration_buffer_seq)
+            return F.relu(exploration_score).squeeze(0)
+        return F.relu(exploration_score)
+    
+    def get_embedding(self, latent_state, action, latent_next_state, exploration_buffer_seq):
+        return self.forward(latent_state, action, latent_next_state, exploration_buffer_seq, get_embedding=True)
+    
+    def compute_loss(self, embedding, temperature=0.1):
+        embedding = F.normalize(embedding, p=2, dim=1)
+        sim_matrix = torch.mm(embedding, embedding.T) / temperature
+        exp_sim_matrix = torch.exp(sim_matrix)
+        numerator = torch.exp(torch.diag(sim_matrix))
+        denominator = torch.sum(exp_sim_matrix, dim=1)
         
-        # Make sure latent_state has batch dimension
-        if latent_state.dim() == 1:
-            latent_state = latent_state.unsqueeze(0)
-            action = action.unsqueeze(0)
-            latent_next_state = latent_next_state.unsqueeze(0)
+        # Compute the loss for each sample and take the mean
+        loss = -torch.log(numerator / denominator)
+        return loss.mean()
+    
+    def compute_combined_loss(self, embedding, latent_state, action, latent_next_state, exploration_buffer_seq, temperature=0.1, lambda_supervised=1):
+        """
+        Compute a combined loss that trains both embedding and fc_out layer
         
-        # Check if exploration buffer has elements and correct dimensions
-        if exploration_buffer_seq.dim() == 3 and exploration_buffer_seq.shape[1] > 0:
-            # Extract components from exploration buffer
-            latent_dim = latent_state.shape[-1]
-            action_dim = action.shape[-1]
+        Args:
+            embedding: Normalized embedding vectors from get_embedding
+            latent_state: Latent state representation
+            action: Action taken
+            latent_next_state: Next latent state
+            exploration_buffer_seq: Sequence of past experiences
+            temperature: Temperature parameter for InfoNCE loss
+            lambda_supervised: Weight for supervised loss component
             
-            # Extract states, actions, and next states from buffer
-            buffer_states = exploration_buffer_seq[:, :, :latent_dim]
-            buffer_actions = exploration_buffer_seq[:, :, latent_dim:latent_dim+action_dim]
-            buffer_next_states = exploration_buffer_seq[:, :, -latent_dim:]
-            
-            # Prepare current transition and action for comparison
-            current_transition = latent_next_state - latent_state  # [B, latent_dim]
-            current_transition = current_transition.unsqueeze(1)  # [B, 1, latent_dim]
-            current_action = action.unsqueeze(1)  # [B, 1, action_dim]
-            
-            # Calculate state transition differences (vectorized)
-            buffer_transitions = buffer_next_states - buffer_states  # [B, seq_len, latent_dim]
-            transition_diffs = torch.linalg.norm(current_transition - buffer_transitions, dim=-1)  # [B, seq_len]
-            
-            # Calculate action differences (vectorized)
-            action_diffs = torch.linalg.norm(current_action - buffer_actions, dim=-1)  # [B, seq_len]
-            
-            # Normalize differences to balance their influence
-            norm_transition_diffs = transition_diffs / transition_diffs.clamp(min=1e-6).mean()
-            norm_action_diffs = action_diffs / action_diffs.clamp(min=1e-6).mean()
-            
-            # Combined similarity using both state transitions and actions
-            # Higher combined_diffs means lower similarity
-            combined_diffs = norm_transition_diffs + norm_action_diffs
-            similarities = 1.0 / (1.0 + combined_diffs)  # [B, seq_len]
-            
-            # Only use valid buffer entries (up to max_seq_len)
-            valid_length = min(self.max_seq_len, exploration_buffer_seq.shape[1])
-            similarities = similarities[:, :valid_length]
-            
-            # Average similarity across buffer entries
-            similarity = similarities.mean(dim=1, keepdim=True)  # [B, 1]
-            
-            # Target: high novelty = low similarity = high score
-            novelty_target = 1.0 - similarity
-            loss = F.mse_loss(exploration_score, novelty_target)
-        else:
-            loss = -exploration_score.mean()
+        Returns:
+            Combined loss that ensures fc_out gets trained
+        """
+        # InfoNCE contrastive loss
+        contrastive_loss = self.compute_loss(embedding, temperature)
         
-        return loss
+        # Get exploration scores from fc_out
+        scores = self(latent_state, action, latent_next_state, exploration_buffer_seq)
+        
+        # Create targets - higher scores for less similar states (diagonal elements)
+        # This trains fc_out to assign higher novelty scores to less similar states
+        similarity = F.cosine_similarity(embedding.unsqueeze(1), embedding.unsqueeze(0), dim=2)
+        targets = 1.0 - torch.diag(similarity)
+        targets = targets.unsqueeze(1)
+        supervised_loss = F.mse_loss(scores, targets)
+        combined_loss = contrastive_loss + lambda_supervised * supervised_loss
+        
+        return combined_loss, contrastive_loss, supervised_loss
     
     def run_inference(self, encoded_data_obs, actor_action, encoded_data_next_obs, trajectory):
         """
