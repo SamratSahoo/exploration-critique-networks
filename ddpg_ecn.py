@@ -149,8 +149,14 @@ class ECNTrainer:
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.actor_target.load_state_dict(self.actor.state_dict())
         
+        # Exploration critic hyperparameters
+        self.exploration_buffer_num_experiences = 50
+        self.exploration_critic_batch_size = 128
+        self.exploration_critic_learning_rate = 1e-3
+
         self.exploration_critic = ExplorationCritic(
-            env, latent_state_size=self.latent_size
+            env, latent_state_size=self.latent_size, 
+            max_seq_len=self.exploration_buffer_num_experiences
         )
         self.exploration_buffer = ExplorationBuffer()
 
@@ -202,10 +208,6 @@ class ECNTrainer:
         # Critic training hyperparameters
         self.critic_learning_rate = 3e-4
         self.critic_batch_size = 128
-
-        # Exploration critic hyperparameters
-        self.exploration_buffer_num_experiences = 50
-        self.exploration_critic_learning_rate = 1e-3
 
         self.replay_buffer = TrajectoryReplayBuffer(
             replay_buffer_size,
@@ -594,7 +596,7 @@ class ECNTrainer:
             list(self.exploration_critic.parameters()), lr=self.exploration_critic_learning_rate
         )
 
-        batch = self.replay_buffer.sample(self.exploration_buffer_num_experiences)
+        batch = self.replay_buffer.sample(self.exploration_critic_batch_size)
 
         with torch.no_grad():
             recent_experiences = self.exploration_buffer.get_last_k_elements(self.exploration_buffer_num_experiences)
@@ -782,7 +784,9 @@ class ECNTrainer:
                         data.trajectory.latent_next_states[:, -1],
                         exploration_buffer_seq
                     ).mean()
-
+                    
+                    if self.global_step % 100 == 0:
+                        writer.add_scalar("charts/exploration_score", exploration_score.item(), self.global_step)
 
                     actor_loss = -critic_value * exploration_score
                     actor_optimizer.zero_grad()
