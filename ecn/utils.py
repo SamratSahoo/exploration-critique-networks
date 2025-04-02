@@ -3,20 +3,26 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 from stable_baselines3.common.buffers import ReplayBuffer
+from typing import NamedTuple
 
-class TrajectoryReplayBufferSamples:
-    """
-    Samples class that contains both the original ReplayBufferSamples and trajectory data.
-    """
-    def __init__(self, replay_samples, trajectory, latent_state=None, latent_next_state=None):
-        self.observations = replay_samples.observations
-        self.actions = replay_samples.actions
-        self.next_observations = replay_samples.next_observations
-        self.dones = replay_samples.dones
-        self.rewards = replay_samples.rewards
-        self.trajectory = trajectory
-        self.latent_state = latent_state
-        self.latent_next_state = latent_next_state
+# Define data structures outside the class
+class TensorTrajectory:
+    def __init__(self, latent_states, actions, latent_next_states):
+        self.latent_states = latent_states
+        self.actions = actions
+        self.latent_next_states = latent_next_states
+
+class TrajectoryReplayBufferSamples(NamedTuple):
+    # Fields from stable_baselines3.common.type_aliases.ReplayBufferSamples
+    observations: torch.Tensor
+    actions: torch.Tensor
+    next_observations: torch.Tensor
+    dones: torch.Tensor
+    rewards: torch.Tensor
+    # Added fields
+    trajectory: TensorTrajectory
+    latent_state: torch.Tensor
+    latent_next_state: torch.Tensor
 
 class RolloutDataset(Dataset):
     def __init__(self, states_np, returns_np, next_states_np, episodic_returns):
@@ -62,10 +68,11 @@ class ExplorationBuffer:
 
 class TrajectoryReplayBuffer(ReplayBuffer):
     """
-    Extension of StableBaselines3 ReplayBuffer that also tracks trajectory history
-    for each state in the buffer.
+    Extension of StableBaselines3 ReplayBuffer that stores trajectory history
+    and latent states directly as tensors for efficient sampling.
+    Assumes n_envs=1.
     """
-    
+
     def __init__(
         self,
         buffer_size,
@@ -77,230 +84,193 @@ class TrajectoryReplayBuffer(ReplayBuffer):
         handle_timeout_termination=True,
         n_envs=1,
     ):
+        # Enforce n_envs=1 for simplicity of tensor shapes
+        assert n_envs == 1, "TrajectoryReplayBuffer currently supports n_envs=1 only"
+
         super().__init__(
-            buffer_size=buffer_size, 
-            observation_space=observation_space, 
-            action_space=action_space, 
-            device=device, 
-            handle_timeout_termination=handle_timeout_termination, 
+            buffer_size=buffer_size,
+            observation_space=observation_space,
+            action_space=action_space,
+            device=device,
+            handle_timeout_termination=handle_timeout_termination,
             n_envs=n_envs
         )
-        
+
         self.trajectory_length = trajectory_length
-        self.trajectory_buffer = deque(maxlen=buffer_size)
-        self.current_trajectory = deque(maxlen=trajectory_length)
-        
-        # Add buffers for latent states
-        self.latent_states_buffer = deque(maxlen=buffer_size)
-        self.latent_next_states_buffer = deque(maxlen=buffer_size)
-        
+        self.latent_size = latent_size
         action_dim = action_space.shape[0]
-        self.empty_element = ExplorationBufferElement(
-            torch.zeros(latent_size, device=device),
-            torch.zeros(action_dim, device=device),
-            torch.zeros(latent_size, device=device)
-        )
-    
+
+        # Pre-allocate tensor storage for latent states
+        self.latent_states = torch.zeros((buffer_size, latent_size), dtype=torch.float32, device=device)
+        self.latent_next_states = torch.zeros((buffer_size, latent_size), dtype=torch.float32, device=device)
+
+        # Pre-allocate tensor storage for trajectory snapshots
+        self.trajectory_latent_states = torch.zeros((buffer_size, trajectory_length, latent_size), dtype=torch.float32, device=device)
+        self.trajectory_actions = torch.zeros((buffer_size, trajectory_length, action_dim), dtype=torch.float32, device=device)
+        self.trajectory_latent_next_states = torch.zeros((buffer_size, trajectory_length, latent_size), dtype=torch.float32, device=device)
+
+        # Rolling buffer for the current trajectory
+        self.current_trajectory_states = torch.zeros((trajectory_length, latent_size), dtype=torch.float32, device=device)
+        self.current_trajectory_actions = torch.zeros((trajectory_length, action_dim), dtype=torch.float32, device=device)
+        self.current_trajectory_next_states = torch.zeros((trajectory_length, latent_size), dtype=torch.float32, device=device)
+        self.current_trajectory_len = 0
+
+
     def add(
-        self, 
-        obs, 
+        self,
+        obs,
         next_obs,
-        action, 
-        reward, 
-        done, 
-        infos, 
-        encoded_obs=None, 
+        action,
+        reward,
+        done,
+        infos,
+        encoded_obs=None,
         encoded_next_obs=None
     ):
         """
-        Add a new experience to the buffer with its trajectory history.
-        
+        Add a new experience and its trajectory context to the buffer.
+
         Args:
-            obs: Current observation
-            next_obs: Next observation
-            action: Action taken
-            reward: Reward received
-            done: Whether the episode is done
-            infos: Additional information
-            encoded_obs: Encoded current observation (latent state)
-            encoded_next_obs: Encoded next observation (latent next state)
+            obs: Current observation (shape: (n_envs, *obs_shape))
+            next_obs: Next observation (shape: (n_envs, *obs_shape))
+            action: Action taken (shape: (n_envs, *action_shape))
+            reward: Reward received (shape: (n_envs,))
+            done: Whether the episode is done (shape: (n_envs,))
+            infos: Additional information (list of dicts)
+            encoded_obs: Encoded current observation (latent state) (shape: (n_envs, latent_size))
+            encoded_next_obs: Encoded next observation (latent next state) (shape: (n_envs, latent_size))
         """
+        # Store the standard experience data
+        # Note: self.pos is the index *before* adding the data
+        current_index = self.pos
         super().add(obs, next_obs, action, reward, done, infos)
-        
+        # After super().add, self.pos points to the *next* available slot
+
         if encoded_obs is not None and encoded_next_obs is not None:
-            # Store the latent states
-            self.latent_states_buffer.append(encoded_obs.squeeze(0) if encoded_obs.dim() > 1 else encoded_obs)
-            self.latent_next_states_buffer.append(encoded_next_obs.squeeze(0) if encoded_next_obs.dim() > 1 else encoded_next_obs)
-            
-            self.current_trajectory.append(
-                ExplorationBufferElement(
-                    encoded_obs.squeeze(0) if encoded_obs.dim() > 1 else encoded_obs,
-                    torch.tensor(action, dtype=torch.float32, device=self.device).squeeze(0) 
-                        if hasattr(action, 'shape') and len(action.shape) > 1 else 
-                        torch.tensor(action, dtype=torch.float32, device=self.device),
-                    encoded_next_obs.squeeze(0) if encoded_next_obs.dim() > 1 else encoded_next_obs
-                )
-            )
-            
-            trajectory_snapshot = list(self.current_trajectory)
-            
-            if len(trajectory_snapshot) < self.trajectory_length:
-                padding = [self.empty_element] * (self.trajectory_length - len(trajectory_snapshot))
-                trajectory_snapshot = padding + trajectory_snapshot
-            
-            self.trajectory_buffer.append(trajectory_snapshot)
-            
-            if done:
-                self.current_trajectory.clear()
-    
-    def sample(self, batch_size):
+            # Ensure inputs are tensors on the correct device
+            lat_state = torch.as_tensor(encoded_obs, device=self.device, dtype=torch.float32).squeeze(0) # Assuming n_envs=1
+            lat_next_state = torch.as_tensor(encoded_next_obs, device=self.device, dtype=torch.float32).squeeze(0) # Assuming n_envs=1
+            act_tensor = torch.as_tensor(action, device=self.device, dtype=torch.float32).squeeze(0) # Assuming n_envs=1
+
+            if lat_state.shape[0] != self.latent_size:
+                 raise ValueError(f"encoded_obs has wrong dimension: {lat_state.shape[0]}, expected {self.latent_size}")
+            if lat_next_state.shape[0] != self.latent_size:
+                 raise ValueError(f"encoded_next_obs has wrong dimension: {lat_next_state.shape[0]}, expected {self.latent_size}")
+            if act_tensor.shape[0] != self.action_space.shape[0]:
+                 raise ValueError(f"action has wrong dimension: {act_tensor.shape[0]}, expected {self.action_space.shape[0]}")
+
+
+            # Store latent states for the current step
+            self.latent_states[current_index] = lat_state
+            self.latent_next_states[current_index] = lat_next_state
+
+            # Update the current trajectory rolling buffer
+            if self.current_trajectory_len < self.trajectory_length:
+                idx = self.current_trajectory_len
+                self.current_trajectory_states[idx] = lat_state
+                self.current_trajectory_actions[idx] = act_tensor
+                self.current_trajectory_next_states[idx] = lat_next_state
+                self.current_trajectory_len += 1
+            else:
+                # Roll buffer to make space for the new element at the end
+                self.current_trajectory_states = torch.roll(self.current_trajectory_states, shifts=-1, dims=0)
+                self.current_trajectory_actions = torch.roll(self.current_trajectory_actions, shifts=-1, dims=0)
+                self.current_trajectory_next_states = torch.roll(self.current_trajectory_next_states, shifts=-1, dims=0)
+                # Add new element at the end
+                self.current_trajectory_states[-1] = lat_state
+                self.current_trajectory_actions[-1] = act_tensor
+                self.current_trajectory_next_states[-1] = lat_next_state
+
+            # Create and store the trajectory snapshot for this step
+            snapshot_states = self.current_trajectory_states
+            snapshot_actions = self.current_trajectory_actions
+            snapshot_next_states = self.current_trajectory_next_states
+
+            if self.current_trajectory_len < self.trajectory_length:
+                # Pad at the beginning if the trajectory is not full yet
+                pad_len = self.trajectory_length - self.current_trajectory_len
+                pad_states = torch.zeros((pad_len, self.latent_size), dtype=torch.float32, device=self.device)
+                pad_actions = torch.zeros((pad_len, self.action_space.shape[0]), dtype=torch.float32, device=self.device)
+                pad_next_states = torch.zeros((pad_len, self.latent_size), dtype=torch.float32, device=self.device)
+
+                snapshot_states = torch.cat((pad_states, self.current_trajectory_states[:self.current_trajectory_len]), dim=0)
+                snapshot_actions = torch.cat((pad_actions, self.current_trajectory_actions[:self.current_trajectory_len]), dim=0)
+                snapshot_next_states = torch.cat((pad_next_states, self.current_trajectory_next_states[:self.current_trajectory_len]), dim=0)
+
+            self.trajectory_latent_states[current_index] = snapshot_states
+            self.trajectory_actions[current_index] = snapshot_actions
+            self.trajectory_latent_next_states[current_index] = snapshot_next_states
+
+            # Reset trajectory if episode ends (use done before squeeze)
+            if done.any(): # Assuming n_envs=1, done is (1,)
+                self.current_trajectory_len = 0
+                # Optionally zero out the rolling buffer tensors
+                # self.current_trajectory_states.zero_()
+                # self.current_trajectory_actions.zero_()
+                # self.current_trajectory_next_states.zero_()
+
+
+    def sample(self, batch_size, env=None):
         """
-        Sample experiences from the buffer and include their trajectories.
-        
+        Sample experiences from the buffer including trajectory and latent states.
+
         Args:
             batch_size: Number of samples to draw
-        
+            env: Optional environment for VecNormalize normalization
+
         Returns:
-            TrajectoryReplayBufferSamples object with trajectory attribute
+            TrajectoryReplayBufferSamples object
         """
-        if self.full:
-            batch_inds = np.random.randint(0, self.buffer_size, size=batch_size)
-        else:
-            batch_inds = np.random.randint(0, self.pos, size=batch_size)
-        
-        replay_samples = super().sample(batch_size)
-        
-        # If trajectory buffer is empty, create a dummy trajectory
-        if len(self.trajectory_buffer) == 0:
-            # Get dimensions
-            latent_state_dim = self.empty_element.latent_state.shape[0]
-            action_dim = self.empty_element.action.shape[0]
-            
-            # Create empty tensors
-            latent_states = torch.zeros(
-                (batch_size, self.trajectory_length, latent_state_dim), 
-                device=self.device
-            )
-            actions = torch.zeros(
-                (batch_size, self.trajectory_length, action_dim), 
-                device=self.device
-            )
-            latent_next_states = torch.zeros(
-                (batch_size, self.trajectory_length, latent_state_dim), 
-                device=self.device
-            )
-            
-            class TensorTrajectory:
-                def __init__(self, latent_states, actions, latent_next_states):
-                    self.latent_states = latent_states
-                    self.actions = actions
-                    self.latent_next_states = latent_next_states
-            
-            dummy_trajectory = TensorTrajectory(latent_states, actions, latent_next_states)
-            
-            # Create dummy latent states
-            dummy_latent_state = torch.zeros(
-                (batch_size, latent_state_dim), 
-                device=self.device
-            )
-            dummy_latent_next_state = torch.zeros(
-                (batch_size, latent_state_dim), 
-                device=self.device
-            )
-            
-            return TrajectoryReplayBufferSamples(replay_samples, dummy_trajectory, 
-                                             dummy_latent_state, dummy_latent_next_state)
-        
-        # Filter valid indices within trajectory buffer range
-        valid_mask = np.logical_and(0 <= batch_inds, batch_inds < len(self.trajectory_buffer))
-        valid_inds = batch_inds[valid_mask]
-        
-        # Get trajectories using list comprehension for better efficiency
-        trajectory_batch = [self.trajectory_buffer[idx] for idx in valid_inds] if len(valid_inds) > 0 else []
-        
-        # Get latent states
-        latent_states_batch = []
-        latent_next_states_batch = []
-        for idx in valid_inds:
-            if idx < len(self.latent_states_buffer):
-                latent_states_batch.append(self.latent_states_buffer[idx])
-            if idx < len(self.latent_next_states_buffer):
-                latent_next_states_batch.append(self.latent_next_states_buffer[idx])
-        
-        # Handle invalid indices
-        if len(valid_inds) < batch_size:
-            padding = [[self.empty_element] * self.trajectory_length] * (batch_size - len(valid_inds))
-            trajectory_batch.extend(padding)
-            
-            # Get dimensions
-            latent_state_dim = self.empty_element.latent_state.shape[0]
-            
-            # Pad latent states
-            latent_states_padding = [torch.zeros(latent_state_dim, device=self.device)] * (batch_size - len(latent_states_batch))
-            latent_next_states_padding = [torch.zeros(latent_state_dim, device=self.device)] * (batch_size - len(latent_next_states_batch))
-            
-            latent_states_batch.extend(latent_states_padding)
-            latent_next_states_batch.extend(latent_next_states_padding)
-        
-        # Convert list of lists to tensor
-        trajectory_tensor = self._convert_trajectories_to_tensor(trajectory_batch)
-        
-        # Stack latent states
-        latent_state = torch.stack(latent_states_batch)
-        latent_next_state = torch.stack(latent_next_states_batch)
-        
-        # Return new samples object with trajectory and latent states
-        return TrajectoryReplayBufferSamples(replay_samples, trajectory_tensor, 
-                                         latent_state, latent_next_state)
-    
-    def _convert_trajectories_to_tensor(self, trajectories):
-        """
-        Convert a list of trajectory lists to a tensor structure.
-        
-        Args:
-            trajectories: List of trajectory lists
-        
-        Returns:
-            Tensor representation of trajectories
-        """
-        # Get dimensions from the first trajectory
-        sample_trajectory = trajectories[0][0]
-        latent_state_dim = sample_trajectory.latent_state.shape[0]
-        action_dim = sample_trajectory.action.shape[0]
-        
-        batch_size = len(trajectories)
-        
-        # Initialize tensors
-        latent_states = torch.zeros(
-            (batch_size, self.trajectory_length, latent_state_dim), 
-            device=self.device
+        # Sample indices using the parent class logic (handles full/not full cases)
+        upper_bound = self.buffer_size if self.full else self.pos
+        if upper_bound == 0: # Handle empty buffer case
+             # Return empty tensors or raise error? Let's return empty tensors matching expected structure
+             action_dim = self.action_space.shape[0]
+             obs_shape = self.observation_space.shape
+             empty_obs = torch.zeros((0, *obs_shape), device=self.device)
+             empty_action = torch.zeros((0, action_dim), device=self.device)
+             empty_reward = torch.zeros((0, 1), device=self.device) # rewards shape is (batch_size, n_envs)
+             empty_done = torch.zeros((0, 1), dtype=torch.long, device=self.device) # dones shape is (batch_size, n_envs)
+             empty_latent = torch.zeros((0, self.latent_size), device=self.device)
+             empty_traj_latent = torch.zeros((0, self.trajectory_length, self.latent_size), device=self.device)
+             empty_traj_action = torch.zeros((0, self.trajectory_length, action_dim), device=self.device)
+
+             empty_tensor_traj = TensorTrajectory(empty_traj_latent, empty_traj_action, empty_traj_latent)
+
+             return TrajectoryReplayBufferSamples(
+                 observations=empty_obs,
+                 actions=empty_action,
+                 next_observations=empty_obs,
+                 dones=empty_done,
+                 rewards=empty_reward,
+                 trajectory=empty_tensor_traj,
+                 latent_state=empty_latent,
+                 latent_next_state=empty_latent,
+             )
+
+        batch_inds = np.random.randint(0, upper_bound, size=batch_size)
+
+        # Get standard replay samples using parent's private method
+        replay_data = self._get_samples(batch_inds, env=env)
+
+        # Sample corresponding latent states and trajectories
+        latent_state = self.latent_states[batch_inds]
+        latent_next_state = self.latent_next_states[batch_inds]
+        traj_states = self.trajectory_latent_states[batch_inds]
+        traj_actions = self.trajectory_actions[batch_inds]
+        traj_next_states = self.trajectory_latent_next_states[batch_inds]
+
+        trajectory_tensors = TensorTrajectory(traj_states, traj_actions, traj_next_states)
+
+        # Combine standard samples with trajectory and latent states
+        samples = TrajectoryReplayBufferSamples(
+            observations=replay_data.observations,
+            actions=replay_data.actions,
+            next_observations=replay_data.next_observations,
+            dones=replay_data.dones,
+            rewards=replay_data.rewards,
+            trajectory=trajectory_tensors,
+            latent_state=latent_state,
+            latent_next_state=latent_next_state,
         )
-        actions = torch.zeros(
-            (batch_size, self.trajectory_length, action_dim), 
-            device=self.device
-        )
-        latent_next_states = torch.zeros(
-            (batch_size, self.trajectory_length, latent_state_dim), 
-            device=self.device
-        )
-        
-        # Stack trajectory elements more efficiently
-        for i, trajectory in enumerate(trajectories):
-            # Extract states, actions, and next states from all elements in this trajectory
-            traj_states = torch.stack([element.latent_state for element in trajectory])
-            traj_actions = torch.stack([element.action for element in trajectory])
-            traj_next_states = torch.stack([element.latent_next_state for element in trajectory])
-            
-            # Assign all at once
-            latent_states[i] = traj_states
-            actions[i] = traj_actions
-            latent_next_states[i] = traj_next_states
-        
-        # Create a new structure similar to ExplorationBufferElement but using tensors
-        class TensorTrajectory:
-            def __init__(self, latent_states, actions, latent_next_states):
-                self.latent_states = latent_states
-                self.actions = actions
-                self.latent_next_states = latent_next_states
-        
-        return TensorTrajectory(latent_states, actions, latent_next_states)
+        return samples

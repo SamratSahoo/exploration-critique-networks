@@ -81,8 +81,8 @@ class ExplorationCritic(nn.Module):
             nn.ReLU(),
             nn.Linear(transformer_embedding_size // 2, 1),
         )
-    
-    def forward(self, latent_state, action, latent_next_state, exploration_buffer_seq, get_embedding=False):
+        
+    def forward(self, latent_state, action, latent_next_state, exploration_buffer_seq):
         # Check if inputs have batch dimension
         has_batch = latent_state.dim() > 1
         if not has_batch:
@@ -104,60 +104,91 @@ class ExplorationCritic(nn.Module):
         query = torch.stack([current_state_token, action_token, next_state_token], dim=0)
         cross_attention_out = self.cross_attention(query, pos_expl_buffer_token)  # [3, B, embed_dim]
         aggregate_cross = cross_attention_out.mean(dim=0)  # [B, embed_dim]
-        if get_embedding:
-            return aggregate_cross
         
         exploration_score = self.fc_out(aggregate_cross)  # [B, 1]
         
         if not has_batch:
-            return F.relu(exploration_score).squeeze(0)
-        return F.relu(exploration_score)
+            return torch.abs(exploration_score).squeeze(0)
+        return torch.abs(exploration_score)
     
-    def get_embedding(self, latent_state, action, latent_next_state, exploration_buffer_seq):
-        return self.forward(latent_state, action, latent_next_state, exploration_buffer_seq, get_embedding=True)
-    
-    def compute_loss(self, embedding, temperature=0.1):
-        embedding = F.normalize(embedding, p=2, dim=1)
-        sim_matrix = torch.mm(embedding, embedding.T) / temperature
-        exp_sim_matrix = torch.exp(sim_matrix)
-        numerator = torch.exp(torch.diag(sim_matrix))
-        denominator = torch.sum(exp_sim_matrix, dim=1)
         
-        # Compute the loss for each sample and take the mean
-        loss = -torch.log(numerator / denominator)
-        return loss.mean()
-    
-    def compute_combined_loss(self, embedding, latent_state, action, latent_next_state, exploration_buffer_seq, temperature=0.1, lambda_supervised=1):
+    def compute_loss(self, latent_state, action, latent_next_state, exploration_buffer_seq):
         """
-        Compute a combined loss that trains both embedding and fc_out layer
-        
-        Args:
-            embedding: Normalized embedding vectors from get_embedding
-            latent_state: Latent state representation
-            action: Action taken
-            latent_next_state: Next latent state
-            exploration_buffer_seq: Sequence of past experiences
-            temperature: Temperature parameter for InfoNCE loss
-            lambda_supervised: Weight for supervised loss component
-            
-        Returns:
-            Combined loss that ensures fc_out gets trained
+        Compute a loss for the exploration critic. Creates a conditional next state distribution based on the exploration buffer sequence.
+        Computes the probability of the next state given the current state and action under the conditional distribution.
+        Subtracts this probability from 1 to get the exploration score (higher probability -> less novelty).
+
+        latent_state: Latent state representation, shape (batch_size, latent_dim)
+        action: Action taken, shape (batch_size, action_dim)
+        latent_next_state: latent next state, shape (batch_size, latent_dim)
+        exploration_buffer_seq: Sequence of past experiences, shape (batch_size, seq_len, latent_dim + action_dim + latent_dim)
+
+        Returns: mean loss value across the batch
         """
-        # InfoNCE contrastive loss
-        contrastive_loss = self.compute_loss(embedding, temperature)
+        # Extract components from exploration buffer
+        latent_dim = latent_state.shape[1]
+        action_dim = action.shape[1]
+        batch_size = latent_state.shape[0]
+        seq_len = exploration_buffer_seq.shape[1]
         
-        # Get exploration scores from fc_out
-        scores = self(latent_state, action, latent_next_state, exploration_buffer_seq)
+        # Split exploration buffer into state, action, next_state components
+        buffer_states = exploration_buffer_seq[:, :, :latent_dim]  # [B, seq_len, latent_dim]
+        buffer_actions = exploration_buffer_seq[:, :, latent_dim:latent_dim+action_dim]  # [B, seq_len, action_dim]
+        buffer_next_states = exploration_buffer_seq[:, :, latent_dim+action_dim:]  # [B, seq_len, latent_dim]
         
-        # Create targets - higher scores for less similar states (diagonal elements)
-        # This trains fc_out to assign higher novelty scores to less similar states
-        similarity = F.cosine_similarity(embedding.unsqueeze(1), embedding.unsqueeze(0), dim=2)
-        targets = 1.0 - torch.diag(similarity)
-        targets = targets.unsqueeze(1)
-        supervised_loss = F.mse_loss(scores, targets)
-        combined_loss = contrastive_loss + lambda_supervised * supervised_loss
+        # Reshape buffer tensors to apply embeddings in a single operation
+        # Flatten batch and sequence dimensions
+        flat_buffer_states = buffer_states.reshape(batch_size * seq_len, -1)  # [B*seq_len, latent_dim]
+        flat_buffer_actions = buffer_actions.reshape(batch_size * seq_len, -1)  # [B*seq_len, action_dim]
         
-        return combined_loss, contrastive_loss, supervised_loss
+        # Apply embeddings
+        embedded_state = self.state_embedding(latent_state)  # [B, embed_dim]
+        embedded_action = self.action_embedding(action)  # [B, embed_dim]
+        
+        flat_embedded_buffer_states = self.state_embedding(flat_buffer_states)  # [B*seq_len, embed_dim]
+        flat_embedded_buffer_actions = self.action_embedding(flat_buffer_actions)  # [B*seq_len, embed_dim]
+        
+        # Reshape back to [B, seq_len, embed_dim]
+        embedded_buffer_states = flat_embedded_buffer_states.reshape(batch_size, seq_len, -1)
+        embedded_buffer_actions = flat_embedded_buffer_actions.reshape(batch_size, seq_len, -1)
+        
+        # Compute similarity kernel between current state-action and buffer state-actions
+        # First concatenate the embeddings
+        current_sa_embedding = torch.cat([embedded_state, embedded_action], dim=1)  # [B, 2*embed_dim]
+        buffer_sa_embeddings = torch.cat([embedded_buffer_states, embedded_buffer_actions], dim=2)  # [B, seq_len, 2*embed_dim]
+        
+        # Reshape for broadcasting
+        current_sa_embedding = current_sa_embedding.unsqueeze(1)  # [B, 1, 2*embed_dim]
+        
+        # Compute L2 distance (squared Euclidean distance)
+        distances = torch.sum((current_sa_embedding - buffer_sa_embeddings)**2, dim=2)  # [B, seq_len]
+        
+        # Apply RBF kernel: K(x,y) = exp(-||x-y||^2 / (2*bandwidth^2))
+        bandwidth = 1.0  # Hyperparameter that can be tuned
+        kernel_weights = torch.exp(-distances / (2 * bandwidth**2))  # [B, seq_len]
+        
+        # Normalize weights to sum to 1
+        kernel_weights = kernel_weights / (torch.sum(kernel_weights, dim=1, keepdim=True) + 1e-10)  # [B, seq_len]
+        
+        # Now compute probability of next state using KDE
+        # Compute distances between current next_state and buffer next_states
+        current_next_state_emb = latent_next_state.unsqueeze(1)  # [B, 1, latent_dim]
+        next_state_distances = torch.sum((current_next_state_emb - buffer_next_states)**2, dim=2)  # [B, seq_len]
+        
+        # Apply RBF kernel for next state similarity
+        next_state_bandwidth = 1.0  # Can be different from state-action bandwidth
+        next_state_kernel = torch.exp(-next_state_distances / (2 * next_state_bandwidth**2))  # [B, seq_len]
+        
+        # This represents P(next_state | state, action) estimated by KDE
+        conditional_density = torch.sum(kernel_weights * next_state_kernel, dim=1)  # [B]
+        conditional_prob = torch.sigmoid(conditional_density)  # [B]
+        
+        target_exploration_score = 1.0 - conditional_prob  # [B]
+        exploration_score = self.forward(latent_state, action, latent_next_state, exploration_buffer_seq)  # [B, 1]
+        exploration_score = exploration_score.squeeze(1)  # [B]
+        
+        loss = torch.abs(exploration_score - target_exploration_score).sum()
+        return loss
     
     def run_inference(self, encoded_data_obs, actor_action, encoded_data_next_obs, trajectory):
         """

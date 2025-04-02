@@ -216,7 +216,7 @@ class ECNTrainer:
             trajectory_length=self.exploration_buffer_num_experiences,
             handle_timeout_termination=False,
         )
-        self.exploration_critic_update_frequency = 10
+        self.exploration_critic_update_frequency = 1000
 
         # Actor Critic Algorithm Hyperparameters
         self.actor_critic_timesteps = actor_critic_timesteps
@@ -594,7 +594,7 @@ class ECNTrainer:
             list(self.exploration_critic.parameters()), lr=self.exploration_critic_learning_rate
         )
 
-        contrastive_batch = self.replay_buffer.sample(self.exploration_buffer_num_experiences)
+        batch = self.replay_buffer.sample(self.exploration_buffer_num_experiences)
 
         with torch.no_grad():
             recent_experiences = self.exploration_buffer.get_last_k_elements(self.exploration_buffer_num_experiences)
@@ -618,54 +618,42 @@ class ECNTrainer:
                 latent_next_state = latent_next_state.unsqueeze(0)
                 
             combined_latent_states = torch.cat([
-                contrastive_batch.latent_state,
+                batch.latent_state,
                 latent_state
             ], dim=0)
             
             combined_actions = torch.cat([
-                contrastive_batch.actions,
+                batch.actions,
                 action
             ], dim=0)
             
             combined_latent_next_states = torch.cat([
-                contrastive_batch.latent_next_state,
+                batch.latent_next_state,
                 latent_next_state
             ], dim=0)
             
-            contrastive_buffer_seq = torch.cat([
-                contrastive_batch.trajectory.latent_states,
-                contrastive_batch.trajectory.actions,
-                contrastive_batch.trajectory.latent_next_states
+            buffer_seq = torch.cat([
+                batch.trajectory.latent_states,
+                batch.trajectory.actions,
+                batch.trajectory.latent_next_states
             ], dim=-1)
 
             combined_exploration_buffer_seq = torch.cat([
-                contrastive_buffer_seq,
+                buffer_seq,
                 exploration_buffer_seq,
             ], dim=0)
-
-        embedding = self.exploration_critic.get_embedding(combined_latent_states, combined_actions, combined_latent_next_states, combined_exploration_buffer_seq)
         
-        combined_loss, contrastive_loss, supervised_loss = self.exploration_critic.compute_combined_loss(
-            embedding,
+        loss = self.exploration_critic.compute_loss(
             combined_latent_states,
             combined_actions,
             combined_latent_next_states,
-            combined_exploration_buffer_seq,
-            temperature=0.1,
-            lambda_supervised=0.1
+            combined_exploration_buffer_seq
         )
-
         optimizer.zero_grad()
-        combined_loss.backward()
+        loss.backward()
         optimizer.step()
-        
-        writer.add_scalars("Loss/exploration_critic_loss", {
-                "combined_loss": combined_loss.item(),
-                "contrastive_loss": contrastive_loss.item(),
-                "supervised_loss": supervised_loss.item()
-            }, self.exploration_critic_loss_counter
-        )
-        self.exploration_critic_loss_counter += self.exploration_critic_update_frequency
+
+        writer.add_scalar("Loss/exploration_critic_loss", loss.item(), self.global_step)
         
         self.exploration_critic.eval()
         
@@ -795,6 +783,7 @@ class ECNTrainer:
                         exploration_buffer_seq
                     ).mean()
 
+
                     actor_loss = -critic_value * exploration_score
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
@@ -834,7 +823,7 @@ class ECNTrainer:
 if __name__ == "__main__":
     ecn_trainer = ECNTrainer(
         envs,
-        print_logs=False
+        print_logs=False,
         # state_value_net="./training_checkpoints/state_value_approximator.pt",
     )
     # ecn_trainer.train_baseline_state_value_network()
