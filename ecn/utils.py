@@ -1,4 +1,4 @@
-from collections import deque, namedtuple
+from collections import namedtuple
 import torch
 from torch.utils.data import Dataset
 import numpy as np
@@ -52,19 +52,89 @@ class RolloutDataset(Dataset):
         )
 
 ExplorationBufferElement = namedtuple(
-    "ExplorationBufferElement", "latent_state action latent_next_state"
+    "ExplorationBufferElement", "latent_state action latent_next_state next_state"
 )
+
+ExplorationBufferSamples = namedtuple(
+    "ExplorationBufferSamples", "latent_states actions latent_next_states next_states"
+)
+
 class ExplorationBuffer:
     def __init__(self, maxlen=5000):
-        self.buffer = deque(maxlen=maxlen)
+        self.maxlen = maxlen
+        self.pos = 0
+        self.full = False
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        self.latent_states = None
+        self.actions = None
+        self.latent_next_states = None
+        self.next_states = None
 
-    def add(self, latent_state, action, latent_next_state):
-        self.buffer.append(
-            ExplorationBufferElement(latent_state, action, latent_next_state)
-        )
+    def _initialize_buffers(self, latent_state, action, latent_next_state, next_state):
+        latent_size = latent_state.shape[0]
+        action_size = action.shape[0]
+        next_state_size = next_state.shape[0]
+        
+        self.latent_states = torch.zeros((self.maxlen, latent_size), dtype=torch.float32, device=self.device)
+        self.actions = torch.zeros((self.maxlen, action_size), dtype=torch.float32, device=self.device)
+        self.latent_next_states = torch.zeros((self.maxlen, latent_size), dtype=torch.float32, device=self.device)
+        self.next_states = torch.zeros((self.maxlen, next_state_size), dtype=torch.float32, device=self.device)
+
+    def add(self, latent_state, action, latent_next_state, next_state):
+        if self.latent_states is None:
+            self._initialize_buffers(latent_state, action, latent_next_state, next_state)
+        
+        latent_state = torch.as_tensor(latent_state, device=self.device)
+        action = torch.as_tensor(action, device=self.device)
+        latent_next_state = torch.as_tensor(latent_next_state, device=self.device)
+        next_state = torch.as_tensor(next_state, device=self.device)
+        
+        self.latent_states[self.pos] = latent_state
+        self.actions[self.pos] = action
+        self.latent_next_states[self.pos] = latent_next_state
+        self.next_states[self.pos] = next_state
+        
+        self.pos = (self.pos + 1) % self.maxlen
+        if not self.full and self.pos == 0:
+            self.full = True
+            
+    def __len__(self):
+        return self.maxlen if self.full else self.pos
         
     def get_last_k_elements(self, k):
-        return list(self.buffer)[max(len(self.buffer) - k, 0):]
+        if len(self) == 0:
+            return None
+            
+        if self.full:
+            if k >= self.maxlen:
+                indices = torch.arange(self.pos, self.pos + self.maxlen) % self.maxlen
+            else:
+                indices = torch.arange(self.pos - k, self.pos) % self.maxlen
+        else:
+            k = min(k, self.pos)
+            indices = torch.arange(self.pos - k, self.pos) % self.maxlen
+            
+        return ExplorationBufferSamples(
+            self.latent_states[indices],
+            self.actions[indices],
+            self.latent_next_states[indices],
+            self.next_states[indices]
+        )
+    
+    def sample(self, k):
+        if len(self) == 0:
+            return None
+            
+        upper_bound = self.maxlen if self.full else self.pos
+        indices = torch.randint(0, upper_bound, (k,), device=self.device)
+        
+        return ExplorationBufferSamples(
+            self.latent_states[indices],
+            self.actions[indices],
+            self.latent_next_states[indices],
+            self.next_states[indices]
+        )
 
 class TrajectoryReplayBuffer(ReplayBuffer):
     """
@@ -84,7 +154,6 @@ class TrajectoryReplayBuffer(ReplayBuffer):
         handle_timeout_termination=True,
         n_envs=1,
     ):
-        # Enforce n_envs=1 for simplicity of tensor shapes
         assert n_envs == 1, "TrajectoryReplayBuffer currently supports n_envs=1 only"
 
         super().__init__(

@@ -123,13 +123,10 @@ class StateAggregationAutoencoder(nn.Module):
 
     def compute_loss(
         self,
-        encoder_out,
         next_state_pred,
         next_states,
         current_state_pred,
         current_state,
-        episodic_return,
-        autoencoder_regularization_coefficient,
     ):
         # Clone tensors to avoid in-place modifications
         current_state_clone = current_state.clone()
@@ -137,24 +134,9 @@ class StateAggregationAutoencoder(nn.Module):
         
         loss_current_state = F.mse_loss(current_state_pred, current_state_clone)
         loss_next_state = F.mse_loss(next_state_pred, next_states_clone)
-        episodic_return_mean = torch.tensor(episodic_return.mean(), device=loss_current_state.device)
         
-        with torch.no_grad():
-            self.running_avg_loss_current = self.update_running_average(
-                self.running_avg_loss_current, loss_current_state.detach()
-            )
-            self.running_avg_loss_next = self.update_running_average(
-                self.running_avg_loss_next, loss_next_state.detach()
-            )
-            # self.running_avg_return = self.update_running_average(
-            #     self.running_avg_return, episodic_return_mean.detach()
-            # )
-        
-        # Scale losses by running averages
-        scaled_loss_current = loss_current_state / (self.running_avg_loss_current + 1e-8)
-        scaled_loss_next = loss_next_state / (self.running_avg_loss_next + 1e-8)
         # scaled_return = episodic_return.mean() / (self.running_avg_return + 1e-8)
-        return (scaled_loss_current + scaled_loss_next)
+        return (loss_current_state + loss_next_state)
 
     def save(self, run_name=None, path=None):
 

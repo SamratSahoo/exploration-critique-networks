@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -JGPUECNTraining
-#SBATCH -N1 --gres=gpu:A100:1 -C A100-80GB
+#SBATCH -N1 --gres=gpu:H200:1
 #SBATCH --mem=64G
 #SBATCH --time=16:00:00
 #SBATCH -q coc-ice
