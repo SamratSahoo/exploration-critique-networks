@@ -478,8 +478,8 @@ class ECNTrainer:
         )
 
         with torch.no_grad():
-            samples = self.exploration_buffer.sample(
-                self.exploration_critic_batch_size * self.exploration_buffer_num_experiences
+            samples = self.exploration_buffer.sample_from_distance(
+                self.exploration_critic_batch_size * self.exploration_buffer_num_experiences, latent_state
             )
             
             # Handle empty buffer case

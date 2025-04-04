@@ -135,6 +135,42 @@ class ExplorationBuffer:
             self.latent_next_states[indices],
             self.next_states[indices]
         )
+    
+    def sample_from_distance(self, k, latent_state):
+        """
+        Stochastically samples k elements from buffer with probabilities proportional to distance (MSE) from latent_state
+        """
+        if len(self) == 0:
+            return None
+        
+        upper_bound = self.maxlen if self.full else self.pos
+        latent_state = torch.as_tensor(latent_state, device=self.device)
+        
+        # Calculate MSE distance between all latent states and the given one
+        # Reshape for broadcasting
+        target = latent_state.view(1, -1)
+        states = self.latent_states[:upper_bound]
+        
+        # Calculate squared distances
+        squared_diff = (states - target)**2
+        distances = torch.mean(squared_diff, dim=1)  # MSE
+        
+        # Convert distances to probabilities
+        # Adding a small epsilon to avoid division by zero
+        # and to ensure non-zero probability for all states
+        epsilon = 1e-6
+        probabilities = distances + epsilon
+        probabilities = probabilities / probabilities.sum()  # Normalize
+        
+        # Sample indices according to these probabilities
+        indices = torch.multinomial(probabilities, k, replacement=True)
+        
+        return ExplorationBufferSamples(
+            self.latent_states[indices],
+            self.actions[indices],
+            self.latent_next_states[indices],
+            self.next_states[indices]
+        )
 
 class TrajectoryReplayBuffer(ReplayBuffer):
     """

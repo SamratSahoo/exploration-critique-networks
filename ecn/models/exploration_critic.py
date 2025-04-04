@@ -67,7 +67,7 @@ class ExplorationCritic(nn.Module):
         encode_layer = nn.TransformerEncoderLayer(
             d_model=transformer_embedding_size, nhead=heads
         )
-        self.exploration_transfromer = nn.TransformerEncoder(encode_layer, num_layers=8)
+        self.exploration_transformer = nn.TransformerEncoder(encode_layer, num_layers=8)
 
         # Cross Attention layer between exploration buffer sequence and current state/action/next state sequence
         # Evaluates novelty of current exploration in reference to previous experience
@@ -99,10 +99,12 @@ class ExplorationCritic(nn.Module):
         expl_buffer_token = self.exploration_embedding(exploration_buffer_seq)  # [B, seq_len, embed_dim]
         expl_buffer_token = expl_buffer_token.transpose(0, 1) # [seq_len, B, embed_dim]
 
-        pos_expl_buffer_token = self.positional_encoding(expl_buffer_token)
+        # pos_expl_buffer_token = self.positional_encoding(expl_buffer_token)
+        # Apply transformer encoder to the exploration buffer tokens
+        encoded_buffer = self.exploration_transformer(expl_buffer_token)  # [seq_len, B, embed_dim]
         # query tensor: [3, B, embed_dim]
         query = torch.stack([current_state_token, action_token, next_state_token], dim=0)
-        cross_attention_out = self.cross_attention(query, pos_expl_buffer_token)  # [3, B, embed_dim]
+        cross_attention_out = self.cross_attention(query, encoded_buffer)  # [3, B, embed_dim]
         aggregate_cross = cross_attention_out.mean(dim=0)  # [B, embed_dim]
         
         exploration_score = self.fc_out(aggregate_cross)  # [B, 1]
