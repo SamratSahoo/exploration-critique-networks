@@ -12,10 +12,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import tyro
-from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import DataLoader
 from sys import platform
+from ddpg_eval import evaluate_ecn
 
 # Models
 from ecn.models.critic import Critic
@@ -703,5 +703,15 @@ if __name__ == "__main__":
         envs,
         print_logs=False
     )
-    # ecn_trainer.train_baseline_state_aggregation_module()
+
     ecn_trainer.train()
+    evaluate_ecn(
+        autoencoder_path=f"{run_name}/models/state_aggregation_autoencoder.pt",
+        actor_path=f"{run_name}/models/actor.pt",
+        make_env=make_env,
+        env_id=args.env_id,
+        eval_episodes=10,
+        run_name=run_name,
+        device=device,
+        exploration_noise=args.exploration_noise
+    )
