@@ -147,11 +147,10 @@ class ECNTrainer:
         self.actor_target.load_state_dict(self.actor.state_dict())
         
         # Exploration critic hyperparameters
-        self.exploration_buffer_num_experiences = 50
-        self.exploration_critic_batch_size = 128
+        self.exploration_buffer_num_experiences = 256
+        self.exploration_critic_batch_size = 256
         self.exploration_critic_learning_rate = 1e-3
         self.exploration_score_decay = 0.99
-        self.exploration_score_ema = None
 
         self.exploration_critic = ExplorationCritic(
             env, latent_state_size=self.latent_size, 
@@ -663,7 +662,7 @@ class ECNTrainer:
                     if self.global_step % 100 == 0:
                         writer.add_scalar("charts/exploration_score", exploration_score.item(), self.global_step)
                     
-                    actor_loss = -critic_value * (1 + exploration_score.item())
+                    actor_loss = -critic_value * (1 + exploration_score)
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
                     actor_optimizer.step()
