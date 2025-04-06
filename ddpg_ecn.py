@@ -156,7 +156,9 @@ class ECNTrainer:
             env, latent_state_size=self.latent_size, 
             max_seq_len=self.exploration_buffer_num_experiences
         )
-        self.exploration_buffer = ExplorationBuffer()
+        self.exploration_buffer = ExplorationBuffer(
+            maxlen=replay_buffer_size,
+        )
 
         if autoencoder:
             self.autoencoder.load_state_dict(torch.load(autoencoder))
@@ -477,49 +479,41 @@ class ECNTrainer:
         )
 
         with torch.no_grad():
+            
+            latent_state = latent_state.repeat(self.exploration_critic_batch_size, 1)
+            action = action.repeat(self.exploration_critic_batch_size, 1)
+            latent_next_state = latent_next_state.repeat(self.exploration_critic_batch_size, 1)
+            next_state = next_state.repeat(self.exploration_critic_batch_size, 1)
+            # Use a fixed batch size of 1 to keep things simple and avoid shape mismatches
             samples = self.exploration_buffer.sample_from_distance(
-                self.exploration_critic_batch_size * self.exploration_buffer_num_experiences, latent_state
+                self.exploration_buffer_num_experiences, latent_state
             )
             
             # Handle empty buffer case
             if samples is None:
                 return
-
-            # Use the pre-stacked tensors directly from samples
-            buffer_latent_states = samples.latent_states
-            buffer_actions = samples.actions
-            buffer_latent_next_states = samples.latent_next_states
+                            
+            # Reshape buffer samples to match expected dimensions
+            buffer_latent_states = samples.latent_states.reshape(self.exploration_critic_batch_size, self.exploration_buffer_num_experiences, -1)
+            buffer_actions = samples.actions.reshape(self.exploration_critic_batch_size, self.exploration_buffer_num_experiences, -1)
+            buffer_latent_next_states = samples.latent_next_states.reshape(self.exploration_critic_batch_size, self.exploration_buffer_num_experiences, -1)
             
-            if latent_state.dim() == 1:
-                latent_state = latent_state.unsqueeze(0)
-            if action.dim() == 1:
-                action = action.unsqueeze(0)                
-            if latent_next_state.dim() == 1:
-                latent_next_state = latent_next_state.unsqueeze(0)
-            if next_state.dim() == 1:
-                next_state = next_state.unsqueeze(0)
-            
-            combined_next_states = next_state.repeat(self.exploration_critic_batch_size, 1)
-            combined_latent_states = latent_state.repeat(self.exploration_critic_batch_size, 1)
-            combined_actions = action.repeat(self.exploration_critic_batch_size, 1)
-            combined_latent_next_states = latent_next_state.repeat(self.exploration_critic_batch_size, 1)
-                        
+            # Create the exploration buffer sequence
             buffer_seq = torch.cat([
                 buffer_latent_states,
                 buffer_actions,
                 buffer_latent_next_states
-            ], dim=-1).reshape(self.exploration_critic_batch_size, self.exploration_buffer_num_experiences, -1)
+            ], dim=-1)
+            
+            # No need to repeat tensors - just use the batch size of 1
+            _, decoder_next_states = self.autoencoder.decoder(latent_next_state)
         
-        _, decoder_next_states = self.autoencoder.decoder(
-            combined_latent_next_states
-        )
-
         loss = self.exploration_critic.compute_loss(
-            latent_state=combined_latent_states,
-            action=combined_actions,
-            latent_next_state=combined_latent_next_states,
+            latent_state=latent_state,
+            action=action,
+            latent_next_state=latent_next_state,
             exploration_buffer_seq=buffer_seq,
-            next_state=combined_next_states,
+            next_state=next_state,
             decoder_next_state=decoder_next_states
         )
         optimizer.zero_grad()
@@ -545,17 +539,7 @@ class ECNTrainer:
         )
 
         obs, _ = self.env.reset(seed=self.seed)
-        
-        max_episode_length = envs.envs[0].spec.max_episode_steps
-        current_episode_states = np.zeros((max_episode_length, *obs.shape[1:]), dtype=np.float32)
-        current_episode_rewards = np.zeros((max_episode_length, 1), dtype=np.float32)
-        current_episode_next_states = np.zeros((max_episode_length, *obs.shape[1:]), dtype=np.float32)
-        episode_step = 0
-        
-        noise_tensor = torch.zeros_like(self.actor(
-            self.autoencoder.encoder(torch.tensor(obs, dtype=torch.float32, device=device))
-        ))
-        
+                
         for global_step in range(self.actor_critic_timesteps):
             self.global_step = global_step
             encoded_obs = self.autoencoder.encoder(torch.tensor(obs, dtype=torch.float32, device=device)).detach().clone()
@@ -565,8 +549,7 @@ class ECNTrainer:
                 )
             else:
                 actions = self.actor(encoded_obs).detach()
-                # noise_tensor = torch.randn_like(actions) * self.actor.action_scale * self.exploration_noise
-                actions = (actions + noise_tensor).cpu().numpy().clip(
+                actions = (actions).cpu().numpy().clip(
                     self.env.single_action_space.low, self.env.single_action_space.high
                 )
 
@@ -587,13 +570,7 @@ class ECNTrainer:
                     encoded_next_obs,
                     torch.tensor(next_obs, dtype=torch.float32, device=device).squeeze(0)
                 )
-            
-            if episode_step < max_episode_length:
-                current_episode_states[episode_step] = obs.squeeze(0)
-                current_episode_rewards[episode_step] = rewards.squeeze(0)
-                current_episode_next_states[episode_step] = next_obs.squeeze(0)
-                episode_step += 1
-            
+                        
             if "final_info" in infos:
                 for reward in infos["final_info"]["episode"]["r"]:
                     if self.print_logs:
@@ -614,7 +591,6 @@ class ECNTrainer:
                         torch.tensor(batch.observations), 
                         torch.tensor(batch.next_observations)
                     )
-                    episode_step = 0
 
             self.replay_buffer.add(
                 obs, real_next_obs, actions, rewards, terminations, infos,
@@ -646,18 +622,31 @@ class ECNTrainer:
                     actor_action = self.actor(latent_observations)
                     critic_value = self.critic(data.observations, actor_action).mean()
 
-                    exploration_buffer_seq = torch.cat([
-                        data.trajectory.latent_states,
-                        data.trajectory.actions,
-                        data.trajectory.latent_next_states
-                    ], dim=-1)
+                    samples = self.exploration_buffer.sample_from_distance(
+                        self.exploration_buffer_num_experiences, latent_observations
+                    )
+                    
+                    if samples is None:
+                        exploration_score = torch.tensor(0.0, device=device)
+                    else: 
+                        buffer_latent_states = samples.latent_states.reshape(self.actor_critic_batch_size, self.exploration_buffer_num_experiences, -1)
+                        buffer_actions = samples.actions.reshape(self.actor_critic_batch_size, self.exploration_buffer_num_experiences, -1)
+                        buffer_latent_next_states = samples.latent_next_states.reshape(self.actor_critic_batch_size, self.exploration_buffer_num_experiences, -1)
 
-                    exploration_score = self.exploration_critic(
-                        latent_observations,
-                        actor_action,
-                        latent_next_observations,
-                        exploration_buffer_seq
-                    ).mean()
+                        exploration_buffer_seq = torch.cat([
+                            buffer_latent_states,
+                            buffer_actions,
+                            buffer_latent_next_states
+                        ], dim=-1).reshape(
+                            self.actor_critic_batch_size, 
+                            self.exploration_buffer_num_experiences, -1)
+                        
+                        exploration_score = self.exploration_critic(
+                            latent_observations,
+                            actor_action,
+                            latent_next_observations,
+                            exploration_buffer_seq
+                        ).mean()
                     
                     if self.global_step % 100 == 0:
                         writer.add_scalar("charts/exploration_score", exploration_score.item(), self.global_step)
@@ -667,11 +656,9 @@ class ECNTrainer:
                     actor_loss.backward()
                     actor_optimizer.step()
                     
-                    # Restore original logging
                     if self.print_logs:
                         print(f"Training Actor Critic: Current timestep: {global_step}/{self.actor_critic_timesteps}, Actor Loss: {actor_loss.item()}, Critic Loss: {qf1_loss.item()}")
 
-                    # update the target network
                     for param, target_param in zip(
                         self.actor.parameters(), self.actor_target.parameters()
                     ):
@@ -700,7 +687,7 @@ class ECNTrainer:
 if __name__ == "__main__":
     ecn_trainer = ECNTrainer(
         envs,
-        print_logs=False
+        print_logs=False,
     )
 
     ecn_trainer.train()

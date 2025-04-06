@@ -117,10 +117,6 @@ class ExplorationCritic(nn.Module):
     def compute_loss(self, latent_state, action, 
                      latent_next_state, exploration_buffer_seq, next_state, decoder_next_state):
         """
-        Compute a loss for the exploration critic. Creates a conditional next state distribution based on the exploration buffer sequence.
-        Computes the probability of the next state given the current state and action under the conditional distribution.
-        Subtracts this probability from 1 to get the exploration score (higher probability -> less novelty).
-
         latent_state: Latent state representation, shape (batch_size, latent_dim)
         action: Action taken, shape (batch_size, action_dim)
         latent_next_state: latent next state, shape (batch_size, latent_dim)
@@ -135,41 +131,6 @@ class ExplorationCritic(nn.Module):
         loss = torch.abs(exploration_score - target_exploration_score).sum()
         return loss
     
-    def run_inference(self, encoded_data_obs, actor_action, encoded_data_next_obs, trajectory):
-        """
-        Run inference using trajectory data from the TrajectoryReplayBuffer
-        
-        Args:
-            encoded_data_obs: Encoded observations (batch_size, obs_dim)
-            actor_action: Actions produced by the actor (batch_size, action_dim)
-            encoded_data_next_obs: Encoded next observations (batch_size, obs_dim)
-            trajectory: Trajectory object containing latent_states, actions, latent_next_states
-                        Each with shape (batch_size, seq_len, dim)
-                        
-        Returns:
-            Mean exploration critic score for the batch
-        """
-        if encoded_data_obs.shape[0] == 0:
-            return torch.tensor(0.0, device=encoded_data_obs.device)
-        
-        # Create the exploration buffer sequence for the entire batch
-        # Shape: [batch_size, seq_len, latent_dim + action_dim + latent_dim]
-        exploration_buffer_seq = torch.cat([
-            trajectory.latent_states,       # [batch_size, seq_len, latent_dim]
-            trajectory.actions,             # [batch_size, seq_len, action_dim]
-            trajectory.latent_next_states   # [batch_size, seq_len, latent_dim]
-        ], dim=2)
-        
-        # Process the entire batch at once
-        scores = self(
-            encoded_data_obs,
-            actor_action,
-            encoded_data_next_obs,
-            exploration_buffer_seq
-        )
-        
-        # Return mean score across the batch
-        return torch.mean(scores)
 
     def save(self, run_name=None, path=None):
         if not path:

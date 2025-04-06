@@ -139,6 +139,14 @@ class ExplorationBuffer:
     def sample_from_distance(self, k, latent_state):
         """
         Stochastically samples k elements from buffer with probabilities proportional to distance (MSE) from latent_state
+
+        Args:
+            k (int): Number of samples to draw per latent state
+            latent_state (torch.Tensor or np.ndarray): Either a single latent state of shape (latent_dim,) 
+                or a batch of latent states of shape (batch_size, latent_dim)
+
+        Returns:
+            ExplorationBufferSamples containing batched samples, or None if buffer is empty
         """
         if len(self) == 0:
             return None
@@ -146,31 +154,78 @@ class ExplorationBuffer:
         upper_bound = self.maxlen if self.full else self.pos
         latent_state = torch.as_tensor(latent_state, device=self.device)
         
-        # Calculate MSE distance between all latent states and the given one
-        # Reshape for broadcasting
-        target = latent_state.view(1, -1)
-        states = self.latent_states[:upper_bound]
+        # Handle both single latent state and batch of latent states
+        single_latent = len(latent_state.shape) == 1
         
-        # Calculate squared distances
-        squared_diff = (states - target)**2
-        distances = torch.mean(squared_diff, dim=1)  # MSE
+        if single_latent:
+            batch_size = 1
+            # Reshape for broadcasting
+            target = latent_state.view(1, 1, -1)  # [1, 1, latent_dim]
+        else:
+            batch_size = latent_state.shape[0]
+            # Reshape for broadcasting
+            target = latent_state.view(batch_size, 1, -1)  # [batch_size, 1, latent_dim]
         
-        # Convert distances to probabilities
-        # Adding a small epsilon to avoid division by zero
-        # and to ensure non-zero probability for all states
-        epsilon = 1e-6
-        probabilities = distances + epsilon
-        probabilities = probabilities / probabilities.sum()  # Normalize
+        states = self.latent_states[:upper_bound].view(1, upper_bound, -1)  # [1, buffer_size, latent_dim]
         
-        # Sample indices according to these probabilities
-        indices = torch.multinomial(probabilities, k, replacement=True)
-        
-        return ExplorationBufferSamples(
-            self.latent_states[indices],
-            self.actions[indices],
-            self.latent_next_states[indices],
-            self.next_states[indices]
-        )
+        if single_latent:
+            # Calculate squared distances for single latent state
+            states = states.squeeze(0)  # [buffer_size, latent_dim]
+            target = target.squeeze(0)  # [1, latent_dim]
+            squared_diff = (states - target)**2
+            distances = torch.mean(squared_diff, dim=1)  # MSE [buffer_size]
+            
+            # Convert distances to probabilities
+            epsilon = 1e-6
+            probabilities = distances + epsilon
+            probabilities = probabilities / probabilities.sum()  # Normalize
+            
+            # Sample indices according to these probabilities
+            indices = torch.multinomial(probabilities, k, replacement=True)
+            
+            return ExplorationBufferSamples(
+                self.latent_states[indices],
+                self.actions[indices],
+                self.latent_next_states[indices],
+                self.next_states[indices]
+            )
+        else:
+            # Calculate distances for each latent state in the batch
+            # Expand dimensions for broadcasting
+            states = states.expand(batch_size, upper_bound, -1)  # [batch_size, buffer_size, latent_dim]
+            
+            # Calculate squared distances
+            squared_diff = (states - target)**2
+            distances = torch.mean(squared_diff, dim=2)  # MSE [batch_size, buffer_size]
+            
+            # Convert distances to probabilities (per batch element)
+            epsilon = 1e-6
+            probabilities = distances + epsilon
+            # Normalize each row (each batch element's probabilities)
+            probabilities = probabilities / probabilities.sum(dim=1, keepdim=True)
+            
+            # Sample indices for each batch element
+            all_indices = []
+            for batch_idx in range(batch_size):
+                batch_probs = probabilities[batch_idx]
+                indices = torch.multinomial(batch_probs, k, replacement=True)
+                all_indices.append(indices)
+            
+            # Stack all indices
+            all_indices = torch.stack(all_indices)  # [batch_size, k]
+            
+            # Flatten and reshape to get the samples
+            flat_indices = all_indices.view(-1)  # [batch_size * k]
+            
+            # Get samples based on indices
+            samples = ExplorationBufferSamples(
+                self.latent_states[flat_indices],
+                self.actions[flat_indices],
+                self.latent_next_states[flat_indices],
+                self.next_states[flat_indices]
+            )
+            
+            return samples
 
 class TrajectoryReplayBuffer(ReplayBuffer):
     """
